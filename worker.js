@@ -156,7 +156,7 @@ export default {
     }
 
     return new Response(
-      "🎮 Servidor multiplayer online!"
-    );
+  "🎮 Servidor multiplayer online! GameRoom ativo."
+);
   }
 };
