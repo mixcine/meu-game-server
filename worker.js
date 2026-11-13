@@ -12,7 +12,6 @@ export class GameRoom extends DurableObject {
     }
 
     const pair = new WebSocketPair();
-
     const client = pair[0];
     const server = pair[1];
 
@@ -21,17 +20,17 @@ export class GameRoom extends DurableObject {
     // Aceita o WebSocket usando o modo Hibernation
     this.ctx.acceptWebSocket(server, [playerId]);
 
-    // Envia o ID para o jogador
+    // Envia o ID para o jogador recém-chegado
     server.send(JSON.stringify({
       type: "welcome",
       id: playerId
     }));
 
     // Informa aos jogadores existentes que um novo jogador entrou
-    this.broadcast({
+    this.broadcast(JSON.stringify({
       type: "playerJoined",
       id: playerId
-    }, server);
+    }), server);
 
     // Envia ao novo jogador os jogadores que já estavam na sala
     for (const socket of this.ctx.getWebSockets()) {
@@ -54,7 +53,6 @@ export class GameRoom extends DurableObject {
   }
 
   webSocketMessage(socket, message) {
-
     let data;
 
     try {
@@ -70,7 +68,7 @@ export class GameRoom extends DurableObject {
 
     // Movimento do jogador
     if (data.type === "move") {
-
+      // PRÉ-SERIALIZAÇÃO: Converte para string apenas uma vez antes do loop
       const update = JSON.stringify({
         type: "playerMove",
         id: playerId,
@@ -80,21 +78,21 @@ export class GameRoom extends DurableObject {
         rotation: Number(data.rotation) || 0
       });
 
-      this.broadcast(update, socket);
+      // Envia imediatamente utilizando o método otimizado
+      this.broadcastPreSerialized(update, socket);
     }
   }
 
   webSocketClose(socket) {
-
     const tags = this.ctx.getTags(socket);
     const playerId = tags[0];
 
     if (!playerId) return;
 
-    this.broadcast({
+    this.broadcast(JSON.stringify({
       type: "playerLeft",
       id: playerId
-    }, socket);
+    }), socket);
   }
 
   webSocketError(socket) {
@@ -103,21 +101,15 @@ export class GameRoom extends DurableObject {
 
     if (!playerId) return;
 
-    this.broadcast({
+    this.broadcast(JSON.stringify({
       type: "playerLeft",
       id: playerId
-    }, socket);
+    }), socket);
   }
 
-  broadcast(data, exceptSocket = null) {
-
-    const message =
-      typeof data === "string"
-        ? data
-        : JSON.stringify(data);
-
+  // Método ultra-rápido para mensagens já serializadas em string
+  broadcastPreSerialized(message, exceptSocket = null) {
     for (const socket of this.ctx.getWebSockets()) {
-
       if (socket === exceptSocket) continue;
 
       try {
@@ -127,18 +119,25 @@ export class GameRoom extends DurableObject {
       }
     }
   }
-}
 
+  // Mantido para compatibilidade com outras chamadas
+  broadcast(data, exceptSocket = null) {
+    const message =
+      typeof data === "string"
+        ? data
+        : JSON.stringify(data);
+
+    this.broadcastPreSerialized(message, exceptSocket);
+  }
+}
 
 export default {
 
   async fetch(request, env) {
-
     const url = new URL(request.url);
 
     // Endpoint do multiplayer
     if (url.pathname === "/game") {
-
       if (request.headers.get("Upgrade") !== "websocket") {
         return new Response(
           "O servidor multiplayer está online. Use WebSocket.",
@@ -149,14 +148,13 @@ export default {
       // Uma sala fixa inicialmente.
       // Depois vamos criar várias salas.
       const id = env.GAME_ROOM.idFromName("GAME-ROOM-001");
-
       const room = env.GAME_ROOM.get(id);
 
       return room.fetch(request);
     }
 
     return new Response(
-  "🎮 Servidor multiplayer online! GameRoom ativo."
-);
+      "🎮 Servidor multiplayer online! GameRoom ativo."
+    );
   }
 };
