@@ -66,6 +66,23 @@ export class GameRoom extends DurableObject {
 
     if (!playerId) return;
 
+    // --- REPASSE DE MENSAGENS WEBRTC (VOZ / MICROFONE) ---
+    if (data.type === "rtc-offer" || data.type === "rtc-answer" || data.type === "rtc-ice") {
+      if (data.to) {
+        // Procura entre os WebSockets conectados qual possui a tag correspondente ao ID de destino
+        for (const clientSocket of this.ctx.getWebSockets()) {
+          const clientTags = this.ctx.getTags(clientSocket);
+          if (clientTags[0] === data.to) {
+            try {
+              clientSocket.send(message); // Repassa o pacote de sinalização diretamente para o outro player
+            } catch {}
+            break;
+          }
+        }
+      }
+      return;
+    }
+
     // Movimento do jogador
     if (data.type === "move") {
       // PRÉ-SERIALIZAÇÃO: Converte para string apenas uma vez antes do loop
@@ -146,7 +163,6 @@ export default {
       }
 
       // Uma sala fixa inicialmente.
-      // Depois vamos criar várias salas.
       const id = env.GAME_ROOM.idFromName("GAME-ROOM-001");
       const room = env.GAME_ROOM.get(id);
 
