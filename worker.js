@@ -3,6 +3,8 @@ import { DurableObject } from "cloudflare:workers";
 export class GameRoom extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
+    // Mantém um mapa em memória para acesso O(1) rápido aos sockets e metadados
+    this.sessions = new Map();
   }
 
   async fetch(request) {
@@ -16,23 +18,27 @@ export class GameRoom extends DurableObject {
     const playerId = crypto.randomUUID();
 
     this.ctx.acceptWebSocket(server, [playerId]);
+    this.sessions.set(server, playerId);
 
+    // Boas-vindas ao jogador
     server.send(JSON.stringify({ type: "welcome", id: playerId }));
 
+    // Avisa os outros que entrou
     this.broadcast(JSON.stringify({ type: "playerJoined", id: playerId }), server);
 
-    for (const socket of this.ctx.getWebSockets()) {
-      if (socket === server) continue;
-      const tags = this.ctx.getTags(socket);
-      if (tags.length > 0) {
-        server.send(JSON.stringify({ type: "existingPlayer", id: tags[0] }));
-      }
+    // Informa os jogadores existentes ao recém-chegado
+    for (const [sock, id] of this.sessions.entries()) {
+      if (sock === server) continue;
+      server.send(JSON.stringify({ type: "existingPlayer", id: id }));
     }
 
     return new Response(null, { status: 101, webSocket: client });
   }
 
   webSocketMessage(socket, message) {
+    const playerId = this.sessions.get(socket);
+    if (!playerId) return;
+
     let data;
     try {
       data = JSON.parse(message);
@@ -40,50 +46,57 @@ export class GameRoom extends DurableObject {
       return;
     }
 
-    const tags = this.ctx.getTags(socket);
-    const playerId = tags[0];
-    if (!playerId) return;
-
-    // Repassa qualquer sinal de voz WebRTC para os demais jogadores na sala
+    // Sinalização WebRTC (Voz por Proximidade) - Direcionada
     if (data.type === "rtc-offer" || data.type === "rtc-answer" || data.type === "rtc-ice") {
       data.from = playerId;
-      this.broadcastPreSerialized(JSON.stringify(data), socket);
+      if (data.to) {
+        for (const [targetSocket, targetId] of this.sessions.entries()) {
+          if (targetId === data.to) {
+            try { targetSocket.send(JSON.stringify(data)); } catch {}
+            break;
+          }
+        }
+      }
       return;
     }
 
+    // Movimento Otimizado: String pré-formatada sem reconstruir objetos pesados a cada envio
     if (data.type === "move") {
-      const update = JSON.stringify({
-        type: "playerMove",
+      const payload = JSON.stringify({
+        t: "m", // Atalho de chave economiza banda
         id: playerId,
-        x: Number(data.x) || 0,
-        y: Number(data.y) || 0,
-        z: Number(data.z) || 0,
-        rotation: Number(data.rotation) || 0
+        x: Math.round(Number(data.x) * 100) / 100, // Arredonda para 2 casas decimais (economia de banda extrema)
+        y: Math.round(Number(data.y) * 100) / 100,
+        z: Math.round(Number(data.z) * 100) / 100,
+        r: Math.round(Number(data.rotation) * 100) / 100
       });
-      this.broadcastPreSerialized(update, socket);
+      this.broadcastToOthers(payload, socket);
     }
   }
 
   webSocketClose(socket) {
-    const tags = this.ctx.getTags(socket);
-    if (tags[0]) this.broadcast(JSON.stringify({ type: "playerLeft", id: tags[0] }), socket);
-  }
-
-  webSocketError(socket) {
-    const tags = this.ctx.getTags(socket);
-    if (tags[0]) this.broadcast(JSON.stringify({ type: "playerLeft", id: tags[0] }), socket);
-  }
-
-  broadcastPreSerialized(message, exceptSocket = null) {
-    for (const socket of this.ctx.getWebSockets()) {
-      if (socket === exceptSocket) continue;
-      try { socket.send(message); } catch {}
+    const playerId = this.sessions.get(socket);
+    if (playerId) {
+      this.sessions.delete(socket);
+      this.broadcast(JSON.stringify({ type: "playerLeft", id: playerId }));
     }
   }
 
-  broadcast(data, exceptSocket = null) {
-    const message = typeof data === "string" ? data : JSON.stringify(data);
-    this.broadcastPreSerialized(message, exceptSocket);
+  webSocketError(socket) {
+    this.webSocketClose(socket);
+  }
+
+  broadcastToOthers(message, exceptSocket) {
+    for (const [sock] of this.sessions.entries()) {
+      if (sock === exceptSocket) continue;
+      try { sock.send(message); } catch {}
+    }
+  }
+
+  broadcast(message) {
+    for (const [sock] of this.sessions.entries()) {
+      try { sock.send(message); } catch {}
+    }
   }
 }
 
@@ -97,6 +110,6 @@ export default {
       const id = env.GAME_ROOM.idFromName("GAME-ROOM-001");
       return env.GAME_ROOM.get(id).fetch(request);
     }
-    return new Response("🎮 Servidor multiplayer online!");
+    return new Response("🎮 Servidor multiplayer global online!");
   }
 };
