@@ -3,14 +3,12 @@ import { DurableObject } from "cloudflare:workers";
 export class GameRoom extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
-    this.players = new Map(); // Armazena dados essenciais de cada player (posição, última atualização)
-    this.pendingMovements = new Map(); // Buffer para envio em lote (Throttling)
-    this.flushInterval = null;
+    this.players = new Map(); // Armazena estado completo de cada player
   }
 
   async fetch(request) {
     if (request.headers.get("Upgrade") !== "websocket") {
-      return new Response("GameRoom Engine v3.0 Online!", { status: 200 });
+      return new Response("GameRoom Engine Online!", { status: 200 });
     }
 
     const pair = new WebSocketPair();
@@ -18,10 +16,10 @@ export class GameRoom extends DurableObject {
     const server = pair[1];
     const playerId = crypto.randomUUID();
 
-    // Aceita a conexão com modo Hibernation do Cloudflare
+    // Aceita o WebSocket com suporte a Hibernation do Cloudflare
     this.ctx.acceptWebSocket(server, [playerId]);
 
-    // Registra o player no estado interno
+    // Registra o player com dados iniciais seguros
     this.players.set(playerId, {
       socket: server,
       x: 0,
@@ -34,46 +32,23 @@ export class GameRoom extends DurableObject {
     // Envia o boas-vindas com o ID único
     server.send(JSON.stringify({ type: "welcome", id: playerId }));
 
-    // Notifica os demais da entrada do novo jogador
+    // Notifica os demais jogadores que alguém entrou
     this.broadcast(JSON.stringify({ type: "playerJoined", id: playerId }), server);
 
-    // Envia a lista de jogadores já presentes para o recém-chegado
+    // Envia ao novo jogador todos os avatares que já estão na sala com suas posições atuais exatas
     for (const [existingId, data] of this.players.entries()) {
       if (existingId === playerId) continue;
       server.send(JSON.stringify({
         type: "existingPlayer",
         id: existingId,
         x: data.x,
-        z: data.z
+        y: data.y,
+        z: data.z,
+        rotation: data.rotation
       }));
     }
 
-    // Inicia o loop de envio em lote se for o primeiro player
-    if (!this.flushInterval && this.players.size > 0) {
-      this.startFlushLoop();
-    }
-
     return new Response(null, { status: 101, webSocket: client });
-  }
-
-  // Loop de alta performance: envia pacotes agrupados a cada ~33ms (30 FPS de rede)
-  startFlushLoop() {
-    this.flushInterval = setInterval(() => {
-      if (this.pendingMovements.size === 0) return;
-
-      const updates = [];
-      for (const [id, moveData] of this.pendingMovements.entries()) {
-        updates.push(moveData);
-      }
-      this.pendingMovements.clear();
-
-      const batchMessage = JSON.stringify({
-        type: "batchMove",
-        players: updates
-      });
-
-      this.broadcastPreSerialized(batchMessage);
-    }, 33);
   }
 
   webSocketMessage(socket, message) {
@@ -93,21 +68,15 @@ export class GameRoom extends DurableObject {
       player.lastSeen = Date.now();
     }
 
-    // --- SINALIZAÇÃO WEBRTC (VOZ) ---
+    // --- REPASSE DE SINALIZAÇÃO WEBRTC (VOZ) ---
     if (data.type === "rtc-offer" || data.type === "rtc-answer" || data.type === "rtc-ice") {
       data.from = playerId;
       this.broadcastPreSerialized(JSON.stringify(data), socket);
       return;
     }
 
-    // --- MOVIMENTAÇÃO COM RATE LIMITING (Anti-Spam / Anti-Cheat básico) ---
+    // --- MOVIMENTAÇÃO INSTANTÂNEA E FLUIDA (Sem teletransporte) ---
     if (data.type === "move") {
-      const now = Date.now();
-      if (player && player.lastMove && now - player.lastMove < 20) {
-        return; // Descarta pacotes excessivos enviados antes de 20ms
-      }
-      if (player) player.lastMove = now;
-
       const x = Number(data.x) || 0;
       const y = Number(data.y) || 0;
       const z = Number(data.z) || 0;
@@ -120,8 +89,17 @@ export class GameRoom extends DurableObject {
         player.rotation = rotation;
       }
 
-      // Adiciona ao buffer para envio em lote
-      this.pendingMovements.set(playerId, { id: playerId, x, y, z, rotation });
+      // Repassa a posição imediatamente para todos os outros (evita o lag visual e o efeito de "travado/teleportando")
+      const update = JSON.stringify({
+        type: "playerMove",
+        id: playerId,
+        x: x,
+        y: y,
+        z: z,
+        rotation: rotation
+      });
+
+      this.broadcastPreSerialized(update, socket);
     }
   }
 
@@ -139,18 +117,11 @@ export class GameRoom extends DurableObject {
     if (!playerId) return;
 
     this.players.delete(playerId);
-    this.pendingMovements.delete(playerId);
 
     this.broadcast(JSON.stringify({
       type: "playerLeft",
       id: playerId
     }), socket);
-
-    // Para o loop de lote se a sala estiver vazia para economizar CPU
-    if (this.players.size === 0 && this.flushInterval) {
-      clearInterval(this.flushInterval);
-      this.flushInterval = null;
-    }
   }
 
   broadcastPreSerialized(message, exceptSocket = null) {
@@ -159,7 +130,7 @@ export class GameRoom extends DurableObject {
       try {
         p.socket.send(message);
       } catch {
-        // Remove sockets quebrados silenciosamente
+        // Conexão morta ignorada com segurança
       }
     }
   }
@@ -180,6 +151,6 @@ export default {
       const id = env.GAME_ROOM.idFromName("GAME-ROOM-001");
       return env.GAME_ROOM.get(id).fetch(request);
     }
-    return new Response("🎮 Servidor Multiplayer Enterprise Ativo!");
+    return new Response("🎮 Servidor Multiplayer Ativo!");
   }
 };
