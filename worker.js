@@ -3,7 +3,6 @@ import { DurableObject } from "cloudflare:workers";
 export class GameRoom extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
-    // Mantém um mapa em memória para acesso O(1) rápido aos sockets e metadados
     this.sessions = new Map();
   }
 
@@ -20,13 +19,13 @@ export class GameRoom extends DurableObject {
     this.ctx.acceptWebSocket(server, [playerId]);
     this.sessions.set(server, playerId);
 
-    // Boas-vindas ao jogador
+    // Boas-vindas com o ID único
     server.send(JSON.stringify({ type: "welcome", id: playerId }));
 
-    // Avisa os outros que entrou
+    // Notifica os outros jogadores que alguém entrou
     this.broadcast(JSON.stringify({ type: "playerJoined", id: playerId }), server);
 
-    // Informa os jogadores existentes ao recém-chegado
+    // Informa ao novo jogador sobre os usuários já presentes na sala
     for (const [sock, id] of this.sessions.entries()) {
       if (sock === server) continue;
       server.send(JSON.stringify({ type: "existingPlayer", id: id }));
@@ -46,7 +45,7 @@ export class GameRoom extends DurableObject {
       return;
     }
 
-    // Sinalização WebRTC (Voz por Proximidade) - Direcionada
+    // Roteamento seguro e direto para a sinalização WebRTC (Voz por Proximidade)
     if (data.type === "rtc-offer" || data.type === "rtc-answer" || data.type === "rtc-ice") {
       data.from = playerId;
       if (data.to) {
@@ -60,15 +59,15 @@ export class GameRoom extends DurableObject {
       return;
     }
 
-    // Movimento Otimizado: String pré-formatada sem reconstruir objetos pesados a cada envio
+    // Movimentação otimizada com chaves compactas para máxima velocidade na rede
     if (data.type === "move") {
       const payload = JSON.stringify({
-        t: "m", // Atalho de chave economiza banda
+        t: "m",
         id: playerId,
-        x: Math.round(Number(data.x) * 100) / 100, // Arredonda para 2 casas decimais (economia de banda extrema)
+        x: Math.round(Number(data.x) * 100) / 100,
         y: Math.round(Number(data.y) * 100) / 100,
         z: Math.round(Number(data.z) * 100) / 100,
-        r: Math.round(Number(data.rotation) * 100) / 100
+        rotation: Math.round(Number(data.rotation) * 100) / 100
       });
       this.broadcastToOthers(payload, socket);
     }
@@ -93,8 +92,9 @@ export class GameRoom extends DurableObject {
     }
   }
 
-  broadcast(message) {
+  broadcast(message, exceptSocket = null) {
     for (const [sock] of this.sessions.entries()) {
+      if (sock === exceptSocket) continue;
       try { sock.send(message); } catch {}
     }
   }
