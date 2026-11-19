@@ -51,6 +51,25 @@ export class GameRoom extends DurableObject {
       return;
     }
 
+    // Repassa mensagens rápidas para os demais jogadores na sala
+    if (data.type === "quickMessage") {
+      const rawText = typeof data.message === "string"
+        ? data.message
+        : (typeof data.text === "string" ? data.text : "");
+      const cleanMessage = rawText.trim().slice(0, 120);
+      if (!cleanMessage) return;
+
+      const payload = JSON.stringify({
+        type: "quickMessage",
+        id: playerId,
+        from: playerId,
+        senderId: playerId,
+        message: cleanMessage
+      });
+      this.broadcastPreSerialized(payload, socket);
+      return;
+    }
+
     if (data.type === "move") {
       const update = JSON.stringify({
         type: "playerMove",
