@@ -18,21 +18,17 @@ export class GameRoom extends DurableObject {
 
     const playerId = crypto.randomUUID();
 
+    // Registra o jogador
     this.ctx.acceptWebSocket(server, [playerId]);
 
-    // Identificação do jogador
+    // Informa o próprio jogador
     this.send(server, {
       type: "welcome",
-      id: playerId
+      id: playerId,
+      serverTime: Date.now()
     });
 
-    // Informa aos jogadores existentes sobre a entrada
-    this.broadcast({
-      type: "playerJoined",
-      id: playerId
-    }, server);
-
-    // Informa ao novo jogador quem já está conectado
+    // Informa os jogadores já conectados
     for (const socket of this.ctx.getWebSockets()) {
       if (socket === server) continue;
 
@@ -45,6 +41,12 @@ export class GameRoom extends DurableObject {
         });
       }
     }
+
+    // Informa os demais jogadores sobre a entrada
+    this.broadcast({
+      type: "playerJoined",
+      id: playerId
+    }, server);
 
     return new Response(null, {
       status: 101,
@@ -61,32 +63,25 @@ export class GameRoom extends DurableObject {
       return;
     }
 
+    if (!data || typeof data.type !== "string") return;
+
     const tags = this.ctx.getTags(socket);
     const playerId = tags[0];
 
-    if (!playerId || !data || typeof data.type !== "string") {
-      return;
-    }
+    if (!playerId) return;
 
-    // =====================================
-    // WEBRTC - VOZ POR PROXIMIDADE
-    // =====================================
-
+    // Comunicação WebRTC
     if (
       data.type === "rtc-offer" ||
       data.type === "rtc-answer" ||
       data.type === "rtc-ice"
     ) {
       data.from = playerId;
-
       this.broadcast(data, socket);
       return;
     }
 
-    // =====================================
-    // MENSAGENS RÁPIDAS
-    // =====================================
-
+    // Mensagens rápidas
     if (data.type === "quickMessage") {
       const rawText =
         typeof data.message === "string"
@@ -110,17 +105,13 @@ export class GameRoom extends DurableObject {
       return;
     }
 
-    // =====================================
-    // MOVIMENTAÇÃO MULTIPLAYER
-    // =====================================
-
+    // Sincronização de movimento
     if (data.type === "move") {
       const x = Number(data.x);
       const y = Number(data.y);
       const z = Number(data.z);
       const rotation = Number(data.rotation);
 
-      // Evita coordenadas inválidas
       if (
         !Number.isFinite(x) ||
         !Number.isFinite(y) ||
@@ -130,79 +121,74 @@ export class GameRoom extends DurableObject {
         return;
       }
 
-      // Preserva o timestamp original do cliente
+      // Evita coordenadas absurdas ou dados inválidos
+      if (
+        Math.abs(x) > 100000 ||
+        Math.abs(y) > 100000 ||
+        Math.abs(z) > 100000 ||
+        Math.abs(rotation) > 100000
+      ) {
+        return;
+      }
+
       const clientTime = Number(data.t);
 
-      const timestamp = Number.isFinite(clientTime)
-        ? clientTime
-        : Date.now();
+      const timestamp =
+        Number.isFinite(clientTime) &&
+        Math.abs(Date.now() - clientTime) < 60000
+          ? clientTime
+          : Date.now();
 
-      // Sequência das atualizações
       const sequence = ++this.moveSequence;
 
-      const update = {
+      this.broadcast({
         type: "playerMove",
         id: playerId,
-
         x,
         y,
         z,
         rotation,
-
-        // Importante para a sincronização do HTML
         t: timestamp,
-        seq: sequence
-      };
-
-      // Envio imediato, sem esperar outros pacotes
-      this.broadcast(update, socket);
+        seq: sequence,
+        serverTime: Date.now()
+      }, socket);
 
       return;
     }
   }
 
-  // =====================================
-  // DESCONEXÃO
-  // =====================================
-
+  // Desconexão
   webSocketClose(socket) {
-    const tags = this.ctx.getTags(socket);
-
-    if (tags.length > 0) {
-      this.broadcast({
-        type: "playerLeft",
-        id: tags[0]
-      }, socket);
-    }
+    this.removePlayer(socket);
   }
 
   webSocketError(socket) {
-    const tags = this.ctx.getTags(socket);
-
-    if (tags.length > 0) {
-      this.broadcast({
-        type: "playerLeft",
-        id: tags[0]
-      }, socket);
-    }
+    this.removePlayer(socket);
   }
 
-  // =====================================
-  // ENVIO INDIVIDUAL
-  // =====================================
+  removePlayer(socket) {
+    const tags = this.ctx.getTags(socket);
 
+    if (!tags.length) return;
+
+    this.broadcast({
+      type: "playerLeft",
+      id: tags[0]
+    }, socket);
+  }
+
+  // Envio individual
   send(socket, data) {
     try {
       if (socket.readyState === 1) {
         socket.send(JSON.stringify(data));
       }
-    } catch {}
+    } catch {
+      // Socket indisponível
+    }
   }
 
-  // =====================================
-  // TRANSMISSÃO MULTIPLAYER
-  // =====================================
-
+  // Transmissão multiplayer
   broadcast(data, exceptSocket = null) {
     const message = JSON.stringify(data);
 
@@ -213,14 +199,12 @@ export class GameRoom extends DurableObject {
         if (socket.readyState === 1) {
           socket.send(message);
         }
-      } catch {}
+      } catch {
+        // Ignora conexões indisponíveis
+      }
     }
   }
 }
-
-// =========================================
-// SERVIDOR PRINCIPAL
-// =========================================
 
 export default {
   async fetch(request, env) {
