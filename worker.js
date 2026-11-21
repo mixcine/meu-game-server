@@ -1,10 +1,10 @@
-
 import { DurableObject } from "cloudflare:workers";
 
 export class GameRoom extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
     this.moveSequence = 0;
+    this.playerStates = new Map();
   }
 
   async fetch(request) {
@@ -20,6 +20,13 @@ export class GameRoom extends DurableObject {
 
     // Registra o jogador
     this.ctx.acceptWebSocket(server, [playerId]);
+    this.playerStates.set(playerId, {
+      x: 0,
+      y: 0,
+      z: 0,
+      rotation: 0,
+      micActive: false
+    });
 
     // Informa o próprio jogador
     this.send(server, {
@@ -28,16 +35,29 @@ export class GameRoom extends DurableObject {
       serverTime: Date.now()
     });
 
-    // Informa os jogadores já conectados
+    // Informa os jogadores já conectados (com posição e estado do mic)
     for (const socket of this.ctx.getWebSockets()) {
       if (socket === server) continue;
 
       const tags = this.ctx.getTags(socket);
-
       if (tags.length > 0) {
+        const existingId = tags[0];
+        const state = this.playerStates.get(existingId) || {
+          x: 0,
+          y: 0,
+          z: 0,
+          rotation: 0,
+          micActive: false
+        };
+
         this.send(server, {
           type: "existingPlayer",
-          id: tags[0]
+          id: existingId,
+          x: state.x,
+          y: state.y,
+          z: state.z,
+          rotation: state.rotation,
+          micActive: state.micActive
         });
       }
     }
@@ -45,7 +65,12 @@ export class GameRoom extends DurableObject {
     // Informa os demais jogadores sobre a entrada
     this.broadcast({
       type: "playerJoined",
-      id: playerId
+      id: playerId,
+      x: 0,
+      y: 0,
+      z: 0,
+      rotation: 0,
+      micActive: false
     }, server);
 
     return new Response(null, {
@@ -70,14 +95,59 @@ export class GameRoom extends DurableObject {
 
     if (!playerId) return;
 
-    // Comunicação WebRTC
+    // Medição de ping
+    if (data.type === "ping") {
+      this.send(socket, {
+        type: "pong",
+        t: data.t,
+        serverTime: Date.now()
+      });
+      return;
+    }
+
+    // Estado do microfone (ativado/desativado)
+    if (data.type === "micState") {
+      const active = Boolean(data.active);
+      const currentState = this.playerStates.get(playerId) || {
+        x: 0,
+        y: 0,
+        z: 0,
+        rotation: 0,
+        micActive: false
+      };
+      currentState.micActive = active;
+      this.playerStates.set(playerId, currentState);
+
+      this.broadcast({
+        type: "micState",
+        from: playerId,
+        id: playerId,
+        active
+      }, socket);
+      return;
+    }
+
+    // Comunicação WebRTC (direcionada ao alvo 'to' quando informado)
     if (
       data.type === "rtc-offer" ||
       data.type === "rtc-answer" ||
       data.type === "rtc-ice"
     ) {
-      data.from = playerId;
-      this.broadcast(data, socket);
+      const payload = {
+        ...data,
+        from: playerId
+      };
+
+      if (typeof data.to === "string" && data.to.length > 0) {
+        const targetSockets = this.ctx.getWebSockets(data.to);
+        for (const targetSocket of targetSockets) {
+          if (targetSocket !== socket) {
+            this.send(targetSocket, payload);
+          }
+        }
+      } else {
+        this.broadcast(payload, socket);
+      }
       return;
     }
 
@@ -121,7 +191,6 @@ export class GameRoom extends DurableObject {
         return;
       }
 
-      // Evita coordenadas absurdas ou dados inválidos
       if (
         Math.abs(x) > 100000 ||
         Math.abs(y) > 100000 ||
@@ -130,6 +199,15 @@ export class GameRoom extends DurableObject {
       ) {
         return;
       }
+
+      const prevState = this.playerStates.get(playerId) || { micActive: false };
+      this.playerStates.set(playerId, {
+        x,
+        y,
+        z,
+        rotation,
+        micActive: prevState.micActive
+      });
 
       const clientTime = Number(data.t);
 
@@ -171,9 +249,12 @@ export class GameRoom extends DurableObject {
 
     if (!tags.length) return;
 
+    const playerId = tags[0];
+    this.playerStates.delete(playerId);
+
     this.broadcast({
       type: "playerLeft",
-      id: tags[0]
+      id: playerId
     }, socket);
   }
 
