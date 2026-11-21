@@ -16,7 +16,7 @@ export class GameRoom extends DurableObject {
     super(ctx, env);
     this.moveSequence = 0;
     this.playerStates = new Map();
-    this.tttPlayers = new Map(); // socketId/playerId -> { id, name, mark }
+    this.tttPlayers = new Map();
     this.board = Array(9).fill(null);
     this.turn = "X";
     this.winner = null;
@@ -265,7 +265,6 @@ export class GameRoom extends DurableObject {
       return;
     }
 
-    // Jogo da velha: entrar na sala
     if (data.type === "join-room") {
       const cleanName = typeof data.name === "string" ? data.name.trim().slice(0, 20) : "";
       if (!cleanName) {
@@ -302,7 +301,6 @@ export class GameRoom extends DurableObject {
       return;
     }
 
-    // Jogo da velha: fazer jogada
     if (data.type === "make-move") {
       const index = Number(data.index);
       const player = this.tttPlayers.get(playerId);
@@ -324,7 +322,6 @@ export class GameRoom extends DurableObject {
       return;
     }
 
-    // Jogo da velha: reiniciar partida
     if (data.type === "reset-game") {
       if (!this.tttPlayers.has(playerId)) return;
       this.resetMatchIfNeeded();
@@ -335,7 +332,6 @@ export class GameRoom extends DurableObject {
       return;
     }
 
-    // Jogo da velha: sair da sala
     if (data.type === "leave-room") {
       this.removePlayer(socket);
     }
@@ -411,7 +407,14 @@ export default {
     }
 
     if (url.pathname === "/ice-config") {
-      const iceServers = [{ urls: "stun:stun.l.google.com:19302" }];
+      const iceServers = [
+        { urls: "stun:stun.cloudflare.com:3478" },
+        { urls: "stun:stun.l.google.com:19302" },
+        { urls: "stun:stun1.l.google.com:19302" },
+        { urls: "stun:stun2.l.google.com:19302" },
+        { urls: "stun:stun3.l.google.com:19302" },
+        { urls: "stun:stun4.l.google.com:19302" }
+      ];
 
       if (env.TURN_URLS) {
         const urls = String(env.TURN_URLS)
