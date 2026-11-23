@@ -1,10 +1,8 @@
+
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-
   "name": "meu-game-server",
-
   "main": "worker.js",
-
   "compatibility_date": "2026-09-03",
 
   "durable_objects": {
@@ -12,12 +10,20 @@
       {
         "name": "GAME_ROOM",
         "class_name": "GameRoom"
+      },
+      {
+        "name": "LOBBY_MANAGER",
+        "class_name": "LobbyManager"
       }
     ]
   },
 
   "exports": {
     "GameRoom": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    },
+    "LobbyManager": {
       "type": "durable-object",
       "storage": "sqlite"
     }
