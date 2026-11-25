@@ -1,7 +1,3 @@
-var __defProp = Object.defineProperty;
-var __name = (target, value) => __defProp(target, "name", { value, configurable: true });
-
-// worker.js
 import { DurableObject } from "cloudflare:workers";
 
 const MAX_PLAYERS = 5;
@@ -19,6 +15,13 @@ const WIN_LINES = [
 
 const DEFAULT_METERED_USERNAME = "1176eedd6d74aa647f55129f";
 const DEFAULT_METERED_CREDENTIAL = "ui23lTtzXzs+S9Iq";
+const DEFAULT_TURN_LIMIT_MB = 480;
+const BYTES_PER_MB = 1024 * 1024;
+
+let memoryAccountsCache = {
+  items: null,
+  expiresAt: 0
+};
 
 function json(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data), {
@@ -61,18 +64,348 @@ async function readJson(request) {
   }
 }
 
+function parsePastefyAccounts(rawText) {
+  let data = typeof rawText === "string" ? JSON.parse(rawText) : rawText;
+
+  if (Array.isArray(data) && data[0]?.contents !== undefined) {
+    data = typeof data[0].contents === "string" ? JSON.parse(data[0].contents) : data[0].contents;
+  } else if (data && typeof data === "object" && !Array.isArray(data) && typeof data.contents === "string") {
+    data = JSON.parse(data.contents);
+  }
+
+  if (!Array.isArray(data) || data.length === 0) {
+    throw new Error("Lista de credenciais no Pastefy inválida ou vazia.");
+  }
+
+  const valid = data
+    .map((item, idx) => ({
+      label: String(item?.label || `Conta_${idx + 1}`),
+      username: String(item?.username || "").trim(),
+      credential: String(item?.credential || "").trim()
+    }))
+    .filter((acc) => acc.username && acc.credential);
+
+  if (valid.length === 0) {
+    throw new Error("Nenhuma credencial válida encontrada no Pastefy.");
+  }
+
+  return valid;
+}
+
+async function getMeteredAccounts(env) {
+  const now = Date.now();
+  if (memoryAccountsCache.items && memoryAccountsCache.items.length > 0 && now < memoryAccountsCache.expiresAt) {
+    return memoryAccountsCache.items;
+  }
+
+  const ttlSec = Math.max(30, Number(env.METERED_CACHE_SECONDS || 300) || 300);
+  const pastefyUrl = String(env.METERED_ACCOUNTS_URL || "").trim();
+
+  if (pastefyUrl) {
+    try {
+      const cache = caches.default;
+      const cacheKey = new Request(`https://cache.internal/pastefy-metered?u=${encodeURIComponent(pastefyUrl)}`);
+      const cachedResp = await cache.match(cacheKey);
+
+      if (cachedResp) {
+        const text = await cachedResp.text();
+        const parsed = parsePastefyAccounts(text);
+        memoryAccountsCache = { items: parsed, expiresAt: now + ttlSec * 1000 };
+        return parsed;
+      }
+
+      const resp = await fetch(pastefyUrl, {
+        headers: { "Accept": "application/json, text/plain;q=0.9" },
+        cf: { cacheTtl: ttlSec, cacheEverything: true }
+      });
+
+      if (!resp.ok) {
+        throw new Error(`HTTP ${resp.status} ao buscar Pastefy`);
+      }
+
+      const text = await resp.text();
+      const parsed = parsePastefyAccounts(text);
+
+      await cache.put(
+        cacheKey,
+        new Response(JSON.stringify(parsed), {
+          headers: {
+            "Content-Type": "application/json; charset=utf-8",
+            "Cache-Control": `public, max-age=${ttlSec}`
+          }
+        })
+      );
+
+      memoryAccountsCache = { items: parsed, expiresAt: now + ttlSec * 1000 };
+      return parsed;
+    } catch (_) {
+      if (memoryAccountsCache.items && memoryAccountsCache.items.length > 0) {
+        return memoryAccountsCache.items;
+      }
+    }
+  }
+
+  return [
+    {
+      label: "Conta_1",
+      username: env.TURN_USERNAME ? String(env.TURN_USERNAME) : DEFAULT_METERED_USERNAME,
+      credential: env.TURN_CREDENTIAL ? String(env.TURN_CREDENTIAL) : DEFAULT_METERED_CREDENTIAL
+    }
+  ];
+}
+
+function buildIceServersForAccount(account) {
+  const turnUser = account.username;
+  const turnPass = account.credential;
+
+  return [
+    { urls: "stun:stun.relay.metered.ca:80" },
+    { urls: "stun:stun.cloudflare.com:3478" },
+    {
+      urls: "turn:global.relay.metered.ca:80",
+      username: turnUser,
+      credential: turnPass
+    },
+    {
+      urls: "turn:global.relay.metered.ca:80?transport=tcp",
+      username: turnUser,
+      credential: turnPass
+    },
+    {
+      urls: "turn:global.relay.metered.ca:443",
+      username: turnUser,
+      credential: turnPass
+    },
+    {
+      urls: "turns:global.relay.metered.ca:443?transport=tcp",
+      username: turnUser,
+      credential: turnPass
+    }
+  ];
+}
+
+function getCycleKeyAndDaysRemaining(nowMs = Date.now()) {
+  const now = new Date(nowMs);
+  const year = now.getUTCFullYear();
+  const month = now.getUTCMonth();
+  const cycleKey = `${year}-${String(month + 1).padStart(2, "0")}`;
+  const nextMonthStartUtc = Date.UTC(year, month + 1, 1, 0, 0, 0, 0);
+  const daysRemaining = Math.max(1, Math.ceil((nextMonthStartUtc - nowMs) / 86400000));
+  return { cycleKey, daysRemaining };
+}
+
 export class LobbyManager extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
     this.ready = ctx.blockConcurrencyWhile(async () => {
-      const rooms = await ctx.storage.get("rooms");
+      const [rooms, turnQuota] = await Promise.all([
+        ctx.storage.get("rooms"),
+        ctx.storage.get("turnQuota")
+      ]);
       this.rooms = rooms && typeof rooms === "object" ? rooms : {};
+      this.turnQuota = turnQuota && typeof turnQuota === "object"
+        ? turnQuota
+        : { cycleKey: "", activeIndex: 0, accounts: {} };
     });
+  }
+
+  ensureTurnCycle(accounts, env) {
+    const { cycleKey, daysRemaining } = getCycleKeyAndDaysRemaining();
+    const limitMb = Math.max(50, Number(env.TURN_QUOTA_LIMIT_MB || DEFAULT_TURN_LIMIT_MB) || DEFAULT_TURN_LIMIT_MB);
+
+    if (this.turnQuota.cycleKey !== cycleKey) {
+      const envIdx = Math.max(0, Number(env.ACTIVE_TURN_INDEX || 0) || 0);
+      this.turnQuota = {
+        cycleKey,
+        activeIndex: envIdx % Math.max(1, accounts.length),
+        accounts: {}
+      };
+    }
+
+    for (let i = 0; i < accounts.length; i++) {
+      const acc = accounts[i];
+      if (!this.turnQuota.accounts[acc.username]) {
+        this.turnQuota.accounts[acc.username] = {
+          label: acc.label || `Conta_${i + 1}`,
+          bytesUsed: 0,
+          exhausted: false,
+          failures: 0,
+          updatedAt: Date.now()
+        };
+      } else {
+        this.turnQuota.accounts[acc.username].label = acc.label || `Conta_${i + 1}`;
+      }
+    }
+
+    let safeIdx = Math.max(0, Number(this.turnQuota.activeIndex) || 0) % accounts.length;
+    if (this.turnQuota.accounts[accounts[safeIdx].username]?.exhausted) {
+      const nextAvailable = accounts.findIndex((a) => !this.turnQuota.accounts[a.username]?.exhausted);
+      if (nextAvailable !== -1) {
+        safeIdx = nextAvailable;
+        this.turnQuota.activeIndex = safeIdx;
+      }
+    }
+
+    return { safeIdx, limitMb, daysRemaining };
   }
 
   async fetch(request) {
     await this.ready;
     const url = new URL(request.url);
+
+    if (url.pathname === "/internal/ice-config" && request.method === "GET") {
+      const accounts = await getMeteredAccounts(this.env);
+      const { safeIdx, limitMb, daysRemaining } = this.ensureTurnCycle(accounts, this.env);
+      const rawIdx = url.searchParams.get("account");
+      const forceRefresh = url.searchParams.get("force") === "1";
+
+      let chosenIdx = safeIdx;
+      if (rawIdx !== null && rawIdx !== "") {
+        chosenIdx = Math.max(0, Number(rawIdx) || 0) % accounts.length;
+      } else if (forceRefresh && this.turnQuota.accounts[accounts[safeIdx].username]?.exhausted) {
+        const nextIdx = accounts.findIndex((a) => !this.turnQuota.accounts[a.username]?.exhausted);
+        if (nextIdx !== -1) {
+          chosenIdx = nextIdx;
+          this.turnQuota.activeIndex = nextIdx;
+        }
+      }
+
+      await this.ctx.storage.put("turnQuota", this.turnQuota);
+      const selected = accounts[chosenIdx];
+      const rec = this.turnQuota.accounts[selected.username] || { bytesUsed: 0, exhausted: false };
+      const usedMb = Number(((rec.bytesUsed || 0) / BYTES_PER_MB).toFixed(2));
+
+      return json({
+        ok: true,
+        accountIndex: chosenIdx,
+        totalAccounts: accounts.length,
+        accountLabel: selected.label || `Conta_${chosenIdx + 1}`,
+        username: selected.username,
+        usedMb,
+        limitMb,
+        daysRemaining,
+        exhausted: Boolean(rec.exhausted),
+        iceServers: buildIceServersForAccount(selected)
+      });
+    }
+
+    if (url.pathname === "/internal/ice-config/report-failure" && request.method === "POST") {
+      const body = await readJson(request);
+      const accounts = await getMeteredAccounts(this.env);
+      const { safeIdx, limitMb, daysRemaining } = this.ensureTurnCycle(accounts, this.env);
+
+      const reportedUser = String(body?.username || accounts[safeIdx].username || "").trim();
+      const reason = String(body?.reason || "ice_failed").slice(0, 80);
+      const force = Boolean(body?.force);
+
+      let failedIdx = accounts.findIndex((a) => a.username === reportedUser);
+      if (failedIdx === -1) failedIdx = safeIdx;
+
+      const failedAcc = accounts[failedIdx];
+      const failedRec = this.turnQuota.accounts[failedAcc.username] || {
+        label: failedAcc.label || `Conta_${failedIdx + 1}`,
+        bytesUsed: 0,
+        exhausted: false,
+        failures: 0
+      };
+
+      failedRec.failures = (Number(failedRec.failures) || 0) + 1;
+      failedRec.lastReason = reason;
+      failedRec.updatedAt = Date.now();
+
+      const shouldMarkExhausted = force || failedRec.failures >= 2 || /quota|limit|401|407|exhaust/i.test(reason);
+      if (shouldMarkExhausted) {
+        failedRec.exhausted = true;
+      }
+      this.turnQuota.accounts[failedAcc.username] = failedRec;
+
+      let nextIdx = (failedIdx + 1) % accounts.length;
+      for (let offset = 1; offset <= accounts.length; offset++) {
+        const candidateIdx = (failedIdx + offset) % accounts.length;
+        const candUser = accounts[candidateIdx].username;
+        if (!this.turnQuota.accounts[candUser]?.exhausted) {
+          nextIdx = candidateIdx;
+          break;
+        }
+      }
+
+      if (accounts.every((a) => this.turnQuota.accounts[a.username]?.exhausted)) {
+        for (const a of accounts) {
+          if (this.turnQuota.accounts[a.username]) {
+            this.turnQuota.accounts[a.username].exhausted = false;
+            this.turnQuota.accounts[a.username].failures = 0;
+          }
+        }
+        nextIdx = (failedIdx + 1) % accounts.length;
+      }
+
+      this.turnQuota.activeIndex = nextIdx;
+      await this.ctx.storage.put("turnQuota", this.turnQuota);
+
+      const nextAcc = accounts[nextIdx];
+      const nextRec = this.turnQuota.accounts[nextAcc.username] || { bytesUsed: 0, exhausted: false };
+      const usedMb = Number(((nextRec.bytesUsed || 0) / BYTES_PER_MB).toFixed(2));
+
+      return json({
+        ok: true,
+        markedExhausted: shouldMarkExhausted,
+        accountIndex: nextIdx,
+        totalAccounts: accounts.length,
+        nextUsername: nextAcc.username,
+        nextAccountLabel: nextAcc.label || `Conta_${nextIdx + 1}`,
+        accountLabel: nextAcc.label || `Conta_${nextIdx + 1}`,
+        usedMb,
+        limitMb,
+        daysRemaining,
+        iceServers: buildIceServersForAccount(nextAcc)
+      });
+    }
+
+    if (url.pathname === "/internal/ice-config/usage" && request.method === "POST") {
+      const body = await readJson(request);
+      const accounts = await getMeteredAccounts(this.env);
+      const { safeIdx, limitMb, daysRemaining } = this.ensureTurnCycle(accounts, this.env);
+
+      const targetUser = String(body?.username || accounts[safeIdx].username || "").trim();
+      const deltaBytes = Math.max(0, Number(body?.bytes) || 0);
+
+      let targetIdx = accounts.findIndex((a) => a.username === targetUser);
+      if (targetIdx === -1) targetIdx = safeIdx;
+
+      const targetAcc = accounts[targetIdx];
+      const rec = this.turnQuota.accounts[targetAcc.username] || {
+        label: targetAcc.label || `Conta_${targetIdx + 1}`,
+        bytesUsed: 0,
+        exhausted: false,
+        failures: 0
+      };
+
+      rec.bytesUsed = (Number(rec.bytesUsed) || 0) + deltaBytes;
+      rec.updatedAt = Date.now();
+
+      const limitBytes = limitMb * BYTES_PER_MB;
+      if (rec.bytesUsed >= limitBytes) {
+        rec.exhausted = true;
+        const nextAvailable = accounts.findIndex((a) => !this.turnQuota.accounts[a.username]?.exhausted && a.username !== targetAcc.username);
+        if (nextAvailable !== -1) {
+          this.turnQuota.activeIndex = nextAvailable;
+        }
+      }
+
+      this.turnQuota.accounts[targetAcc.username] = rec;
+      await this.ctx.storage.put("turnQuota", this.turnQuota);
+
+      const usedMb = Number((rec.bytesUsed / BYTES_PER_MB).toFixed(2));
+      return json({
+        ok: true,
+        username: targetAcc.username,
+        accountLabel: rec.label,
+        usedMb,
+        limitMb,
+        daysRemaining,
+        exhausted: Boolean(rec.exhausted)
+      });
+    }
 
     if (url.pathname === "/internal/room" && request.method === "GET") {
       const code = safeRoomName(url.searchParams.get("code")).toUpperCase();
@@ -564,49 +897,53 @@ export default {
     const lobbyId = env.LOBBY_MANAGER.idFromName("global-lobby");
     const lobby = env.LOBBY_MANAGER.get(lobbyId);
 
-    if (url.pathname === "/ice-config") {
-      const turnUser = env.TURN_USERNAME ? String(env.TURN_USERNAME) : DEFAULT_METERED_USERNAME;
-      const turnPass = env.TURN_CREDENTIAL ? String(env.TURN_CREDENTIAL) : DEFAULT_METERED_CREDENTIAL;
-
-      const iceServers = [
-        { urls: "stun:stun.relay.metered.ca:80" },
-        { urls: "stun:stun.cloudflare.com:3478" },
-        {
-          urls: "turn:global.relay.metered.ca:80",
-          username: turnUser,
-          credential: turnPass
-        },
-        {
-          urls: "turn:global.relay.metered.ca:80?transport=tcp",
-          username: turnUser,
-          credential: turnPass
-        },
-        {
-          urls: "turn:global.relay.metered.ca:443",
-          username: turnUser,
-          credential: turnPass
-        },
-        {
-          urls: "turns:global.relay.metered.ca:443?transport=tcp",
-          username: turnUser,
-          credential: turnPass
-        }
-      ];
-
-      if (env.TURN_URLS) {
-        const urls = String(env.TURN_URLS)
-          .split(",")
-          .map((value) => value.trim())
-          .filter(Boolean);
-        if (urls.length) {
-          const customTurn = { urls };
-          if (env.TURN_USERNAME) customTurn.username = String(env.TURN_USERNAME);
-          if (env.TURN_CREDENTIAL) customTurn.credential = String(env.TURN_CREDENTIAL);
-          iceServers.push(customTurn);
-        }
+    if (url.pathname === "/ice-config" && request.method === "GET") {
+      const query = new URLSearchParams();
+      if (url.searchParams.has("account")) {
+        query.set("account", url.searchParams.get("account"));
       }
+      if (url.searchParams.has("force")) {
+        query.set("force", url.searchParams.get("force"));
+      }
+      const qs = query.toString();
+      const response = await lobby.fetch(
+        `https://lobby.internal/internal/ice-config${qs ? `?${qs}` : ""}`
+      );
+      const headers = new Headers(response.headers);
+      for (const [key, value] of Object.entries(cors)) {
+        headers.set(key, value);
+      }
+      return new Response(response.body, { status: response.status, headers });
+    }
 
-      return json({ iceServers }, 200, cors);
+    if (url.pathname === "/ice-config/report-failure" && request.method === "POST") {
+      const response = await lobby.fetch(
+        new Request("https://lobby.internal/internal/ice-config/report-failure", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: request.body
+        })
+      );
+      const headers = new Headers(response.headers);
+      for (const [key, value] of Object.entries(cors)) {
+        headers.set(key, value);
+      }
+      return new Response(response.body, { status: response.status, headers });
+    }
+
+    if (url.pathname === "/ice-config/usage" && request.method === "POST") {
+      const response = await lobby.fetch(
+        new Request("https://lobby.internal/internal/ice-config/usage", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: request.body
+        })
+      );
+      const headers = new Headers(response.headers);
+      for (const [key, value] of Object.entries(cors)) {
+        headers.set(key, value);
+      }
+      return new Response(response.body, { status: response.status, headers });
     }
 
     if (
@@ -673,6 +1010,8 @@ export default {
         "POST /matchmaking/find",
         "GET /game?room=CODIGO",
         "GET /ice-config",
+        "POST /ice-config/report-failure",
+        "POST /ice-config/usage",
         "GET /health"
       ]
     }, 200, cors);
