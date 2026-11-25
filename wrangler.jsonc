@@ -24,9 +24,15 @@
       ]
     }
   ],
+  "triggers": {
+    "crons": [
+      "0 3 * * *"
+    ]
+  },
   "vars": {
     "ACTIVE_TURN_INDEX": "0",
     "METERED_ACCOUNTS_URL": "https://pastefy.app/fKPMN7uS/raw",
+    "PASTEFY_PASTE_ID": "fKPMN7uS",
     "METERED_CACHE_SECONDS": "300",
     "TURN_QUOTA_MB": "480",
     "TURN_RESET_DAYS": "30"
