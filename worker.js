@@ -1,3 +1,7 @@
+var __defProp = Object.defineProperty;
+var __name = (target, value) => __defProp(target, "name", { value, configurable: true });
+
+// worker.js
 import { DurableObject } from "cloudflare:workers";
 
 const MAX_PLAYERS = 5;
@@ -13,8 +17,14 @@ const WIN_LINES = [
   [2, 4, 6]
 ];
 
+const DEFAULT_PASTEFY_ACCOUNTS_URL = "https://pastefy.app/fKPMN7uS/raw";
 const DEFAULT_METERED_USERNAME = "1176eedd6d74aa647f55129f";
 const DEFAULT_METERED_CREDENTIAL = "ui23lTtzXzs+S9Iq";
+
+let memoryAccountsCache = {
+  items: null,
+  expiresAt: 0
+};
 
 function json(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data), {
@@ -55,6 +65,126 @@ async function readJson(request) {
   } catch {
     return null;
   }
+}
+
+function parsePastefyAccounts(rawText) {
+  let data = typeof rawText === "string" ? JSON.parse(rawText) : rawText;
+
+  if (Array.isArray(data) && data[0]?.contents !== undefined) {
+    data = typeof data[0].contents === "string" ? JSON.parse(data[0].contents) : data[0].contents;
+  } else if (data && typeof data === "object" && !Array.isArray(data) && typeof data.contents === "string") {
+    data = JSON.parse(data.contents);
+  }
+
+  if (!Array.isArray(data) || data.length === 0) {
+    throw new Error("Lista de credenciais no Pastefy inválida ou vazia.");
+  }
+
+  const valid = data
+    .map((item, idx) => ({
+      label: String(item?.label || `Conta_${idx + 1}`),
+      username: String(item?.username || "").trim(),
+      credential: String(item?.credential || "").trim()
+    }))
+    .filter((acc) => acc.username && acc.credential);
+
+  if (valid.length === 0) {
+    throw new Error("Nenhuma credencial válida encontrada no Pastefy.");
+  }
+
+  return valid;
+}
+
+async function getMeteredAccounts(env) {
+  const now = Date.now();
+  if (memoryAccountsCache.items && memoryAccountsCache.items.length > 0 && now < memoryAccountsCache.expiresAt) {
+    return memoryAccountsCache.items;
+  }
+
+  const ttlSec = Math.max(30, Number(env.METERED_CACHE_SECONDS || 300) || 300);
+  const pastefyUrl = String(env.METERED_ACCOUNTS_URL || DEFAULT_PASTEFY_ACCOUNTS_URL).trim();
+
+  if (pastefyUrl) {
+    try {
+      const cache = caches.default;
+      const cacheKey = new Request(`https://cache.internal/pastefy-metered?u=${encodeURIComponent(pastefyUrl)}`);
+      const cachedResp = await cache.match(cacheKey);
+
+      if (cachedResp) {
+        const text = await cachedResp.text();
+        const parsed = parsePastefyAccounts(text);
+        memoryAccountsCache = { items: parsed, expiresAt: now + ttlSec * 1000 };
+        return parsed;
+      }
+
+      const resp = await fetch(pastefyUrl, {
+        headers: { "Accept": "application/json, text/plain;q=0.9" },
+        cf: { cacheTtl: ttlSec, cacheEverything: true }
+      });
+
+      if (!resp.ok) {
+        throw new Error(`HTTP ${resp.status} ao buscar Pastefy`);
+      }
+
+      const text = await resp.text();
+      const parsed = parsePastefyAccounts(text);
+
+      await cache.put(
+        cacheKey,
+        new Response(JSON.stringify(parsed), {
+          headers: {
+            "Content-Type": "application/json; charset=utf-8",
+            "Cache-Control": `public, max-age=${ttlSec}`
+          }
+        })
+      );
+
+      memoryAccountsCache = { items: parsed, expiresAt: now + ttlSec * 1000 };
+      return parsed;
+    } catch (_) {
+      if (memoryAccountsCache.items && memoryAccountsCache.items.length > 0) {
+        return memoryAccountsCache.items;
+      }
+    }
+  }
+
+  return [
+    {
+      label: "Conta_1",
+      username: env.TURN_USERNAME ? String(env.TURN_USERNAME) : DEFAULT_METERED_USERNAME,
+      credential: env.TURN_CREDENTIAL ? String(env.TURN_CREDENTIAL) : DEFAULT_METERED_CREDENTIAL
+    }
+  ];
+}
+
+function buildIceServersForAccount(account) {
+  const turnUser = account.username;
+  const turnPass = account.credential;
+
+  return [
+    { urls: "stun:stun.relay.metered.ca:80" },
+    { urls: "stun:stun.cloudflare.com:3478" },
+    {
+      urls: "turn:global.relay.metered.ca:80",
+      username: turnUser,
+      credential: turnPass
+    },
+    {
+      urls: "turn:global.relay.metered.ca:80?transport=tcp",
+      username: turnUser,
+      credential: turnPass
+    },
+    {
+      urls: "turn:global.relay.metered.ca:443",
+      username: turnUser,
+      credential: turnPass
+    },
+    {
+      urls: "turns:global.relay.metered.ca:443?transport=tcp",
+      username: turnUser,
+      credential: turnPass
+    }
+  ];
 }
 
 export class LobbyManager extends DurableObject {
@@ -561,48 +691,19 @@ export default {
     const lobby = env.LOBBY_MANAGER.get(lobbyId);
 
     if (url.pathname === "/ice-config") {
-      const turnUser = env.TURN_USERNAME ? String(env.TURN_USERNAME) : DEFAULT_METERED_USERNAME;
-      const turnPass = env.TURN_CREDENTIAL ? String(env.TURN_CREDENTIAL) : DEFAULT_METERED_CREDENTIAL;
+      const accounts = await getMeteredAccounts(env);
+      const rawIdx = url.searchParams.get("account");
+      const defaultIdx = Math.max(0, Number(env.ACTIVE_TURN_INDEX || 0) || 0);
+      const parsedIdx = rawIdx !== null ? Math.max(0, Number(rawIdx) || 0) : defaultIdx;
+      const safeIndex = parsedIdx % accounts.length;
+      const selected = accounts[safeIndex];
 
-      const iceServers = [
-        { urls: "stun:stun.relay.metered.ca:80" },
-        { urls: "stun:stun.cloudflare.com:3478" },
-        {
-          urls: "turn:global.relay.metered.ca:80",
-          username: turnUser,
-          credential: turnPass
-        },
-        {
-          urls: "turn:global.relay.metered.ca:80?transport=tcp",
-          username: turnUser,
-          credential: turnPass
-        },
-        {
-          urls: "turn:global.relay.metered.ca:443",
-          username: turnUser,
-          credential: turnPass
-        },
-        {
-          urls: "turns:global.relay.metered.ca:443?transport=tcp",
-          username: turnUser,
-          credential: turnPass
-        }
-      ];
-
-      if (env.TURN_URLS) {
-        const urls = String(env.TURN_URLS)
-          .split(",")
-          .map((value) => value.trim())
-          .filter(Boolean);
-        if (urls.length) {
-          const customTurn = { urls };
-          if (env.TURN_USERNAME) customTurn.username = String(env.TURN_USERNAME);
-          if (env.TURN_CREDENTIAL) customTurn.credential = String(env.TURN_CREDENTIAL);
-          iceServers.push(customTurn);
-        }
-      }
-
-      return json({ iceServers }, 200, cors);
+      return json({
+        accountIndex: safeIndex,
+        totalAccounts: accounts.length,
+        accountLabel: selected.label || `Conta_${safeIndex + 1}`,
+        iceServers: buildIceServersForAccount(selected)
+      }, 200, cors);
     }
 
     if (
