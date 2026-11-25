@@ -1,7 +1,3 @@
-var __defProp = Object.defineProperty;
-var __name = (target, value) => __defProp(target, "name", { value, configurable: true });
-
-// worker.js
 import { DurableObject } from "cloudflare:workers";
 
 const MAX_PLAYERS = 5;
@@ -77,6 +73,8 @@ function extractRawAccountsArray(rawText) {
     data = typeof data[0].contents === "string" ? JSON.parse(data[0].contents) : data[0].contents;
   } else if (data && typeof data === "object" && !Array.isArray(data) && typeof data.contents === "string") {
     data = JSON.parse(data.contents);
+  } else if (data && typeof data === "object" && !Array.isArray(data) && Array.isArray(data.accounts)) {
+    data = data.accounts;
   }
 
   if (!Array.isArray(data) || data.length === 0) {
@@ -94,7 +92,7 @@ function parsePastefyAccounts(rawText) {
       label: String(item?.label || `Conta_${idx + 1}`),
       username: String(item?.username || "").trim(),
       credential: String(item?.credential || "").trim(),
-      day: Math.max(0, Number(item?.day ?? 0) || 0)
+      day: Math.max(0, Number(item?.day ?? item?.daysRemaining ?? 0) || 0)
     }))
     .filter((acc) => acc.username && acc.credential);
 
@@ -190,7 +188,6 @@ async function syncDaysToPastefy(env, daysByUsername) {
     return { ok: false, skipped: true, reason: "PASTEFY_API_KEY não configurada." };
   }
 
-  // Lê o conteúdo atual via API do Pastefy para não perder contas ou credenciais
   const getResp = await fetch(`https://pastefy.app/api/v2/paste/${encodeURIComponent(pasteId)}`, {
     headers: {
       "Authorization": `Bearer ${apiKey}`,
