@@ -1,31 +1,32 @@
-
 {
-  "$schema": "./node_modules/wrangler/config-schema.json",
+  "$schema": "node_modules/wrangler/config-schema.json",
   "name": "meu-game-server",
   "main": "worker.js",
-  "compatibility_date": "2026-09-03",
-
+  "compatibility_date": "2025-09-27",
   "durable_objects": {
     "bindings": [
       {
-        "name": "GAME_ROOM",
-        "class_name": "GameRoom"
-      },
-      {
         "name": "LOBBY_MANAGER",
         "class_name": "LobbyManager"
+      },
+      {
+        "name": "GAME_ROOM",
+        "class_name": "GameRoom"
       }
     ]
   },
-
-  "exports": {
-    "GameRoom": {
-      "type": "durable-object",
-      "storage": "sqlite"
-    },
-    "LobbyManager": {
-      "type": "durable-object",
-      "storage": "sqlite"
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "LobbyManager",
+        "GameRoom"
+      ]
     }
+  ],
+  "vars": {
+    "ACTIVE_TURN_INDEX": "0",
+    "METERED_ACCOUNTS_URL": "https://pastefy.app/fKPMN7uS/raw",
+    "METERED_CACHE_SECONDS": "300"
   }
 }
