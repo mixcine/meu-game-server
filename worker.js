@@ -1,3 +1,7 @@
+var __defProp = Object.defineProperty;
+var __name = (target, value) => __defProp(target, "name", { value, configurable: true });
+
+// worker.js
 import { DurableObject } from "cloudflare:workers";
 
 const MAX_PLAYERS = 5;
@@ -14,12 +18,14 @@ const WIN_LINES = [
 ];
 
 const DEFAULT_PASTEFY_ACCOUNTS_URL = "https://pastefy.app/fKPMN7uS/raw";
+const DEFAULT_PASTEFY_PASTE_ID = "fKPMN7uS";
 const DEFAULT_METERED_USERNAME = "1176eedd6d74aa647f55129f";
 const DEFAULT_METERED_CREDENTIAL = "ui23lTtzXzs+S9Iq";
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 let memoryAccountsCache = {
   items: null,
+  rawList: null,
   expiresAt: 0
 };
 
@@ -64,7 +70,7 @@ async function readJson(request) {
   }
 }
 
-function parsePastefyAccounts(rawText) {
+function extractRawAccountsArray(rawText) {
   let data = typeof rawText === "string" ? JSON.parse(rawText) : rawText;
 
   if (Array.isArray(data) && data[0]?.contents !== undefined) {
@@ -77,11 +83,18 @@ function parsePastefyAccounts(rawText) {
     throw new Error("Lista de credenciais no Pastefy inválida ou vazia.");
   }
 
+  return data;
+}
+
+function parsePastefyAccounts(rawText) {
+  const data = extractRawAccountsArray(rawText);
+
   const valid = data
     .map((item, idx) => ({
       label: String(item?.label || `Conta_${idx + 1}`),
       username: String(item?.username || "").trim(),
-      credential: String(item?.credential || "").trim()
+      credential: String(item?.credential || "").trim(),
+      day: Math.max(0, Number(item?.day ?? 0) || 0)
     }))
     .filter((acc) => acc.username && acc.credential);
 
@@ -92,9 +105,20 @@ function parsePastefyAccounts(rawText) {
   return valid;
 }
 
-async function getMeteredAccounts(env) {
+async function clearAccountsCache(env) {
+  memoryAccountsCache = { items: null, rawList: null, expiresAt: 0 };
+  const pastefyUrl = String(env.METERED_ACCOUNTS_URL || DEFAULT_PASTEFY_ACCOUNTS_URL).trim();
+  if (!pastefyUrl) return;
+  try {
+    const cache = caches.default;
+    const cacheKey = new Request(`https://cache.internal/pastefy-metered?u=${encodeURIComponent(pastefyUrl)}`);
+    await cache.delete(cacheKey);
+  } catch (_) {}
+}
+
+async function getMeteredAccounts(env, bypassCache = false) {
   const now = Date.now();
-  if (memoryAccountsCache.items && memoryAccountsCache.items.length > 0 && now < memoryAccountsCache.expiresAt) {
+  if (!bypassCache && memoryAccountsCache.items && memoryAccountsCache.items.length > 0 && now < memoryAccountsCache.expiresAt) {
     return memoryAccountsCache.items;
   }
 
@@ -105,18 +129,20 @@ async function getMeteredAccounts(env) {
     try {
       const cache = caches.default;
       const cacheKey = new Request(`https://cache.internal/pastefy-metered?u=${encodeURIComponent(pastefyUrl)}`);
-      const cachedResp = await cache.match(cacheKey);
 
-      if (cachedResp) {
-        const text = await cachedResp.text();
-        const parsed = parsePastefyAccounts(text);
-        memoryAccountsCache = { items: parsed, expiresAt: now + ttlSec * 1000 };
-        return parsed;
+      if (!bypassCache) {
+        const cachedResp = await cache.match(cacheKey);
+        if (cachedResp) {
+          const text = await cachedResp.text();
+          const parsed = parsePastefyAccounts(text);
+          memoryAccountsCache = { items: parsed, rawList: parsed, expiresAt: now + ttlSec * 1000 };
+          return parsed;
+        }
       }
 
       const resp = await fetch(pastefyUrl, {
         headers: { "Accept": "application/json, text/plain;q=0.9" },
-        cf: { cacheTtl: ttlSec, cacheEverything: true }
+        cf: { cacheTtl: bypassCache ? 0 : ttlSec, cacheEverything: !bypassCache }
       });
 
       if (!resp.ok) {
@@ -126,17 +152,19 @@ async function getMeteredAccounts(env) {
       const text = await resp.text();
       const parsed = parsePastefyAccounts(text);
 
-      await cache.put(
-        cacheKey,
-        new Response(JSON.stringify(parsed), {
-          headers: {
-            "Content-Type": "application/json; charset=utf-8",
-            "Cache-Control": `public, max-age=${ttlSec}`
-          }
-        })
-      );
+      if (!bypassCache) {
+        await cache.put(
+          cacheKey,
+          new Response(JSON.stringify(parsed), {
+            headers: {
+              "Content-Type": "application/json; charset=utf-8",
+              "Cache-Control": `public, max-age=${ttlSec}`
+            }
+          })
+        );
+      }
 
-      memoryAccountsCache = { items: parsed, expiresAt: now + ttlSec * 1000 };
+      memoryAccountsCache = { items: parsed, rawList: parsed, expiresAt: now + ttlSec * 1000 };
       return parsed;
     } catch (_) {
       if (memoryAccountsCache.items && memoryAccountsCache.items.length > 0) {
@@ -149,9 +177,63 @@ async function getMeteredAccounts(env) {
     {
       label: "Conta_1",
       username: env.TURN_USERNAME ? String(env.TURN_USERNAME) : DEFAULT_METERED_USERNAME,
-      credential: env.TURN_CREDENTIAL ? String(env.TURN_CREDENTIAL) : DEFAULT_METERED_CREDENTIAL
+      credential: env.TURN_CREDENTIAL ? String(env.TURN_CREDENTIAL) : DEFAULT_METERED_CREDENTIAL,
+      day: 0
     }
   ];
+}
+
+async function syncDaysToPastefy(env, daysByUsername) {
+  const apiKey = String(env.PASTEFY_API_KEY || "").trim();
+  const pasteId = String(env.PASTEFY_PASTE_ID || DEFAULT_PASTEFY_PASTE_ID).trim();
+  if (!apiKey || !pasteId) {
+    return { ok: false, skipped: true, reason: "PASTEFY_API_KEY não configurada." };
+  }
+
+  // Lê o conteúdo atual via API do Pastefy para não perder contas ou credenciais
+  const getResp = await fetch(`https://pastefy.app/api/v2/paste/${encodeURIComponent(pasteId)}`, {
+    headers: {
+      "Authorization": `Bearer ${apiKey}`,
+      "Accept": "application/json"
+    }
+  });
+
+  if (!getResp.ok) {
+    return { ok: false, error: `Falha ao ler paste (${getResp.status})` };
+  }
+
+  const pastePayload = await getResp.json();
+  const rawContent = pastePayload?.paste?.content ?? pastePayload?.content ?? "[]";
+  const currentList = extractRawAccountsArray(rawContent);
+
+  const updatedList = currentList.map((item, idx) => {
+    const user = String(item?.username || "").trim();
+    const day = daysByUsername.has(user) ? daysByUsername.get(user) : Math.max(0, Number(item?.day ?? 0) || 0);
+    return {
+      ...item,
+      label: item?.label || `Conta_${idx + 1}`,
+      day
+    };
+  });
+
+  const putResp = await fetch(`https://pastefy.app/api/v2/paste/${encodeURIComponent(pasteId)}`, {
+    method: "PUT",
+    headers: {
+      "Authorization": `Bearer ${apiKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      content: JSON.stringify(updatedList, null, 2)
+    })
+  });
+
+  if (!putResp.ok) {
+    const errBody = await putResp.text().catch(() => "");
+    return { ok: false, error: `Falha ao atualizar paste (${putResp.status}): ${errBody}` };
+  }
+
+  await clearAccountsCache(env);
+  return { ok: true, updatedCount: updatedList.length };
 }
 
 function buildIceServersForAccount(account) {
@@ -205,7 +287,11 @@ export class LobbyManager extends DurableObject {
     return days * DAY_MS;
   }
 
-  ensureAccountQuotaRecord(username, now) {
+  ensureAccountQuotaRecord(accOrUsername, now) {
+    const isObj = typeof accOrUsername === "object" && accOrUsername !== null;
+    const username = isObj ? accOrUsername.username : String(accOrUsername);
+    const initialDay = isObj ? Math.max(0, Number(accOrUsername.day || 0) || 0) : 0;
+
     const resetMs = this.getResetPeriodMs();
     let rec = this.turnQuotaState[username];
 
@@ -213,14 +299,15 @@ export class LobbyManager extends DurableObject {
       rec = {
         usedBytes: 0,
         cycleStartedAt: now,
-        exhaustedUntil: 0,
+        exhaustedUntil: initialDay > 0 ? now + initialDay * DAY_MS : 0,
         failures: 0
       };
       this.turnQuotaState[username] = rec;
-      return { rec, changed: true };
+      return { rec, changed: true, resetOccurred: false };
     }
 
     let changed = false;
+    let resetOccurred = false;
 
     if (rec.exhaustedUntil > 0 && now >= rec.exhaustedUntil) {
       rec.usedBytes = 0;
@@ -228,15 +315,31 @@ export class LobbyManager extends DurableObject {
       rec.exhaustedUntil = 0;
       rec.failures = 0;
       changed = true;
+      resetOccurred = true;
     } else if (rec.cycleStartedAt > 0 && now - rec.cycleStartedAt >= resetMs) {
       rec.usedBytes = 0;
       rec.cycleStartedAt = now;
       rec.exhaustedUntil = 0;
       rec.failures = 0;
       changed = true;
+      resetOccurred = true;
     }
 
-    return { rec, changed };
+    return { rec, changed, resetOccurred };
+  }
+
+  computeDaysRemaining(rec, now) {
+    if (!rec || !rec.exhaustedUntil || rec.exhaustedUntil <= now) return 0;
+    return Math.max(1, Math.ceil((rec.exhaustedUntil - now) / DAY_MS));
+  }
+
+  buildDaysMap(accounts, now) {
+    const map = new Map();
+    for (const acc of accounts) {
+      const rec = this.turnQuotaState[acc.username];
+      map.set(acc.username, this.computeDaysRemaining(rec, now));
+    }
+    return map;
   }
 
   selectAvailableAccount(accounts, preferredIndex = 0) {
@@ -244,6 +347,7 @@ export class LobbyManager extends DurableObject {
     const limitBytes = this.getQuotaLimitBytes();
     const resetMs = this.getResetPeriodMs();
     let dirty = false;
+    let stateTransition = false;
 
     const total = accounts.length;
     const startIdx = ((Math.max(0, Number(preferredIndex) || 0)) % total + total) % total;
@@ -251,16 +355,18 @@ export class LobbyManager extends DurableObject {
     for (let offset = 0; offset < total; offset++) {
       const idx = (startIdx + offset) % total;
       const acc = accounts[idx];
-      const { rec, changed } = this.ensureAccountQuotaRecord(acc.username, now);
+      const { rec, changed, resetOccurred } = this.ensureAccountQuotaRecord(acc, now);
       if (changed) dirty = true;
+      if (resetOccurred) stateTransition = true;
 
       if (rec.usedBytes >= limitBytes && rec.exhaustedUntil === 0) {
         rec.exhaustedUntil = (rec.cycleStartedAt || now) + resetMs;
         dirty = true;
+        stateTransition = true;
       }
 
       if (rec.exhaustedUntil === 0 || now >= rec.exhaustedUntil) {
-        return { index: idx, account: acc, record: rec, allExhausted: false, dirty };
+        return { index: idx, account: acc, record: rec, allExhausted: false, dirty, stateTransition };
       }
     }
 
@@ -280,7 +386,8 @@ export class LobbyManager extends DurableObject {
       account: accounts[earliestIdx],
       record: this.turnQuotaState[accounts[earliestIdx].username],
       allExhausted: true,
-      dirty
+      dirty,
+      stateTransition
     };
   }
 
@@ -292,9 +399,13 @@ export class LobbyManager extends DurableObject {
       const accounts = await getMeteredAccounts(this.env);
       const preferredIdx = Math.max(0, Number(this.env.ACTIVE_TURN_INDEX || 0) || 0);
       const picked = this.selectAvailableAccount(accounts, preferredIdx);
+      const now = Date.now();
 
       if (picked.dirty) {
         await this.ctx.storage.put("turnQuotaState", this.turnQuotaState);
+      }
+      if (picked.stateTransition) {
+        this.ctx.waitUntil(syncDaysToPastefy(this.env, this.buildDaysMap(accounts, now)));
       }
 
       const limitBytes = this.getQuotaLimitBytes();
@@ -309,7 +420,8 @@ export class LobbyManager extends DurableObject {
         usedMb,
         limitMb,
         allExhausted: picked.allExhausted,
-        nextResetAt: picked.record?.exhaustedUntil || ((picked.record?.cycleStartedAt || Date.now()) + this.getResetPeriodMs()),
+        daysRemaining: this.computeDaysRemaining(picked.record, now),
+        nextResetAt: picked.record?.exhaustedUntil || ((picked.record?.cycleStartedAt || now) + this.getResetPeriodMs()),
         iceServers: buildIceServersForAccount(picked.account)
       });
     }
@@ -322,22 +434,30 @@ export class LobbyManager extends DurableObject {
         return json({ ok: false, error: "Dados de consumo inválidos." }, 400);
       }
 
+      const accounts = await getMeteredAccounts(this.env);
       const now = Date.now();
       const limitBytes = this.getQuotaLimitBytes();
       const resetMs = this.getResetPeriodMs();
       const { rec } = this.ensureAccountQuotaRecord(username, now);
 
       rec.usedBytes += deltaBytes;
+      let newlyExhausted = false;
       if (rec.usedBytes >= limitBytes && rec.exhaustedUntil === 0) {
         rec.exhaustedUntil = (rec.cycleStartedAt || now) + resetMs;
+        newlyExhausted = true;
       }
 
       await this.ctx.storage.put("turnQuotaState", this.turnQuotaState);
+      if (newlyExhausted) {
+        this.ctx.waitUntil(syncDaysToPastefy(this.env, this.buildDaysMap(accounts, now)));
+      }
+
       return json({
         ok: true,
         username,
         usedMb: Number((rec.usedBytes / (1024 * 1024)).toFixed(2)),
         exhausted: rec.exhaustedUntil > now,
+        daysRemaining: this.computeDaysRemaining(rec, now),
         exhaustedUntil: rec.exhaustedUntil
       });
     }
@@ -350,11 +470,13 @@ export class LobbyManager extends DurableObject {
         return json({ ok: false, error: "Username obrigatório." }, 400);
       }
 
+      const accounts = await getMeteredAccounts(this.env);
       const now = Date.now();
       const limitBytes = this.getQuotaLimitBytes();
       const resetMs = this.getResetPeriodMs();
       const { rec } = this.ensureAccountQuotaRecord(username, now);
 
+      const wasExhausted = rec.exhaustedUntil > now;
       rec.failures = (rec.failures || 0) + 1;
 
       if (force || rec.failures >= 3) {
@@ -363,14 +485,17 @@ export class LobbyManager extends DurableObject {
       }
 
       await this.ctx.storage.put("turnQuotaState", this.turnQuotaState);
+      if (!wasExhausted && rec.exhaustedUntil > now) {
+        this.ctx.waitUntil(syncDaysToPastefy(this.env, this.buildDaysMap(accounts, now)));
+      }
 
-      const accounts = await getMeteredAccounts(this.env);
       const preferredIdx = Math.max(0, Number(this.env.ACTIVE_TURN_INDEX || 0) || 0);
       const nextPicked = this.selectAvailableAccount(accounts, preferredIdx);
 
       return json({
         ok: true,
         markedExhausted: rec.exhaustedUntil > now,
+        daysRemaining: this.computeDaysRemaining(rec, now),
         exhaustedUntil: rec.exhaustedUntil,
         nextAccountIndex: nextPicked.index,
         nextAccountLabel: nextPicked.account.label,
@@ -383,15 +508,15 @@ export class LobbyManager extends DurableObject {
       const accounts = await getMeteredAccounts(this.env);
       const now = Date.now();
       const limitBytes = this.getQuotaLimitBytes();
-      const resetMs = this.getResetPeriodMs();
       let dirty = false;
+      let stateTransition = false;
 
       const summary = accounts.map((acc, index) => {
-        const { rec, changed } = this.ensureAccountQuotaRecord(acc.username, now);
+        const { rec, changed, resetOccurred } = this.ensureAccountQuotaRecord(acc, now);
         if (changed) dirty = true;
+        if (resetOccurred) stateTransition = true;
         const exhausted = rec.exhaustedUntil > now;
-        const resetTarget = exhausted ? rec.exhaustedUntil : ((rec.cycleStartedAt || now) + resetMs);
-        const daysRemaining = exhausted ? Math.max(1, Math.ceil((resetTarget - now) / DAY_MS)) : 0;
+        const daysRemaining = this.computeDaysRemaining(rec, now);
 
         return {
           index,
@@ -400,6 +525,7 @@ export class LobbyManager extends DurableObject {
           usedMb: Number((rec.usedBytes / (1024 * 1024)).toFixed(2)),
           limitMb: Math.round(limitBytes / (1024 * 1024)),
           exhausted,
+          day: daysRemaining,
           daysRemaining,
           resetAt: exhausted ? new Date(rec.exhaustedUntil).toISOString() : null
         };
@@ -408,6 +534,9 @@ export class LobbyManager extends DurableObject {
       if (dirty) {
         await this.ctx.storage.put("turnQuotaState", this.turnQuotaState);
       }
+      if (stateTransition) {
+        this.ctx.waitUntil(syncDaysToPastefy(this.env, this.buildDaysMap(accounts, now)));
+      }
 
       return json({
         ok: true,
@@ -415,6 +544,24 @@ export class LobbyManager extends DurableObject {
         availableAccounts: summary.filter((s) => !s.exhausted).length,
         accounts: summary
       });
+    }
+
+    if (url.pathname === "/internal/sync-pastefy" && request.method === "POST") {
+      const accounts = await getMeteredAccounts(this.env, true);
+      const now = Date.now();
+      let dirty = false;
+
+      for (const acc of accounts) {
+        const { changed } = this.ensureAccountQuotaRecord(acc, now);
+        if (changed) dirty = true;
+      }
+
+      if (dirty) {
+        await this.ctx.storage.put("turnQuotaState", this.turnQuotaState);
+      }
+
+      const syncResult = await syncDaysToPastefy(this.env, this.buildDaysMap(accounts, now));
+      return json(syncResult, syncResult.ok ? 200 : 500);
     }
 
     if (url.pathname === "/internal/room" && request.method === "GET") {
@@ -907,6 +1054,14 @@ async function forwardToLobbyWithCors(lobby, internalPath, request, cors) {
 }
 
 export default {
+  async scheduled(event, env, ctx) {
+    const lobbyId = env.LOBBY_MANAGER.idFromName("global-lobby");
+    const lobby = env.LOBBY_MANAGER.get(lobbyId);
+    ctx.waitUntil(
+      lobby.fetch("https://lobby.internal/internal/sync-pastefy", { method: "POST" })
+    );
+  },
+
   async fetch(request, env) {
     const url = new URL(request.url);
     const cors = corsHeaders();
@@ -932,6 +1087,10 @@ export default {
 
     if (url.pathname === "/ice-config/status" && request.method === "GET") {
       return forwardToLobbyWithCors(lobby, "/internal/ice-status", request, cors);
+    }
+
+    if (url.pathname === "/ice-config/sync-pastefy" && request.method === "POST") {
+      return forwardToLobbyWithCors(lobby, "/internal/sync-pastefy", request, cors);
     }
 
     if (
@@ -994,6 +1153,7 @@ export default {
         "POST /ice-config/usage",
         "POST /ice-config/report-failure",
         "GET /ice-config/status",
+        "POST /ice-config/sync-pastefy",
         "GET /health"
       ]
     }, 200, cors);
