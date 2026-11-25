@@ -3,10 +3,18 @@ import { DurableObject } from "cloudflare:workers";
 const MAX_PLAYERS = 5;
 const ROOM_CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const WIN_LINES = [
-  [0, 1, 2], [3, 4, 5], [6, 7, 8],
-  [0, 3, 6], [1, 4, 7], [2, 5, 8],
-  [0, 4, 8], [2, 4, 6]
+  [0, 1, 2],
+  [3, 4, 5],
+  [6, 7, 8],
+  [0, 3, 6],
+  [1, 4, 7],
+  [2, 5, 8],
+  [0, 4, 8],
+  [2, 4, 6]
 ];
+
+const DEFAULT_METERED_USERNAME = "1176eedd6d74aa647f55129f";
+const DEFAULT_METERED_CREDENTIAL = "ui23lTtzXzs+S9Iq";
 
 function json(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data), {
@@ -34,7 +42,7 @@ function normalizeRegion(value) {
 
 function makeRoomCode() {
   const bytes = crypto.getRandomValues(new Uint8Array(6));
-  return Array.from(bytes, byte => ROOM_CODE_CHARS[byte % ROOM_CODE_CHARS.length]).join("");
+  return Array.from(bytes, (byte) => ROOM_CODE_CHARS[byte % ROOM_CODE_CHARS.length]).join("");
 }
 
 function safeRoomName(value) {
@@ -49,10 +57,6 @@ async function readJson(request) {
   }
 }
 
-/**
- * Registry central: cria códigos, lista salas e escolhe salas para matchmaking.
- * O estado do registro é persistido no armazenamento SQLite do Durable Object.
- */
 export class LobbyManager extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
@@ -69,18 +73,25 @@ export class LobbyManager extends DurableObject {
     if (url.pathname === "/internal/room" && request.method === "GET") {
       const code = safeRoomName(url.searchParams.get("code")).toUpperCase();
       const room = this.rooms[code];
-      return room ? json({ ok: true, room }) : json({ ok: false, error: "Sala não encontrada." }, 404);
+      return room
+        ? json({ ok: true, room })
+        : json({ ok: false, error: "Sala não encontrada." }, 404);
     }
 
     if (url.pathname === "/internal/update" && request.method === "POST") {
       const body = await readJson(request);
-      if (!body || typeof body.code !== "string") return json({ error: "Dados inválidos." }, 400);
+      if (!body || typeof body.code !== "string") {
+        return json({ error: "Dados inválidos." }, 400);
+      }
       const code = body.code.toUpperCase();
       const room = this.rooms[code];
-      if (!room) return json({ error: "Sala não encontrada." }, 404);
-
+      if (!room) {
+        return json({ error: "Sala não encontrada." }, 404);
+      }
       const players = Number(body.players);
-      room.players = Number.isFinite(players) ? Math.max(0, Math.min(MAX_PLAYERS, Math.floor(players))) : room.players;
+      room.players = Number.isFinite(players)
+        ? Math.max(0, Math.min(MAX_PLAYERS, Math.floor(players)))
+        : room.players;
       room.updatedAt = Date.now();
 
       if (room.players === 0) {
@@ -98,7 +109,6 @@ export class LobbyManager extends DurableObject {
       const body = await readJson(request);
       const region = normalizeRegion(body?.region);
       const name = safeRoomName(body?.name) || "Partida ONY";
-
       const code = await this.createRoom({ region, name });
       return json({
         ok: true,
@@ -112,9 +122,8 @@ export class LobbyManager extends DurableObject {
       const requestedRegion = url.searchParams.get("region");
       const region = requestedRegion ? normalizeRegion(requestedRegion) : null;
       const rooms = Object.values(this.rooms)
-        .filter(room => room.players < MAX_PLAYERS && (!region || room.region === region))
+        .filter((room) => room.players < MAX_PLAYERS && (!region || room.region === region))
         .sort((a, b) => b.updatedAt - a.updatedAt);
-
       return json({ ok: true, rooms, maxPlayers: MAX_PLAYERS });
     }
 
@@ -122,10 +131,12 @@ export class LobbyManager extends DurableObject {
       const body = await readJson(request);
       const code = safeRoomName(body?.code).toUpperCase();
       const room = this.rooms[code];
-
-      if (!room) return json({ ok: false, error: "Código de sala inválido." }, 404);
-      if (room.players >= MAX_PLAYERS) return json({ ok: false, error: "Esta sala está cheia." }, 409);
-
+      if (!room) {
+        return json({ ok: false, error: "Código de sala inválido." }, 404);
+      }
+      if (room.players >= MAX_PLAYERS) {
+        return json({ ok: false, error: "Esta sala está cheia." }, 409);
+      }
       return json({
         ok: true,
         code,
@@ -139,9 +150,8 @@ export class LobbyManager extends DurableObject {
     if (url.pathname === "/matchmaking/find" && request.method === "POST") {
       const body = await readJson(request);
       const region = normalizeRegion(body?.region);
-
       const available = Object.values(this.rooms)
-        .filter(room => room.region === region && room.players < MAX_PLAYERS)
+        .filter((room) => room.region === region && room.players < MAX_PLAYERS)
         .sort((a, b) => a.players - b.players || b.updatedAt - a.updatedAt)[0];
 
       if (available) {
@@ -191,10 +201,6 @@ export class LobbyManager extends DurableObject {
   }
 }
 
-/**
- * Uma instância por partida. A capacidade é validada aqui, no ponto de entrada
- * real do WebSocket, para impedir que duas entradas simultâneas ultrapassem 5.
- */
 export class GameRoom extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
@@ -217,7 +223,6 @@ export class GameRoom extends DurableObject {
         this.tttPlayers = new Map(Array.isArray(saved.tttPlayers) ? saved.tttPlayers : []);
       }
 
-      // Recupera os dados associados às conexões WebSocket após hibernação.
       for (const socket of this.ctx.getWebSockets()) {
         const attachment = socket.deserializeAttachment();
         if (attachment?.playerId) {
@@ -233,8 +238,7 @@ export class GameRoom extends DurableObject {
 
   async fetch(request) {
     await this.ready;
-
-    if (request.headers.get("Upgrade") !== "websocket") {
+    if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
       return json({
         ok: true,
         service: "ONY GameRoom",
@@ -270,7 +274,6 @@ export class GameRoom extends DurableObject {
       const attachment = socket.deserializeAttachment();
       if (!attachment?.playerId) continue;
       const existingState = attachment.state || this.defaultPlayerState();
-
       this.send(server, {
         type: "existingPlayer",
         id: attachment.playerId,
@@ -287,7 +290,6 @@ export class GameRoom extends DurableObject {
     }, server);
 
     await this.updateLobbyCount(activeSockets.length + 1);
-
     return new Response(null, { status: 101, webSocket: client });
   }
 
@@ -308,7 +310,9 @@ export class GameRoom extends DurableObject {
         return;
       }
     }
-    if (this.board.every(cell => cell !== null)) this.draw = true;
+    if (this.board.every((cell) => cell !== null)) {
+      this.draw = true;
+    }
   }
 
   async persistGameState() {
@@ -329,10 +333,23 @@ export class GameRoom extends DurableObject {
     this.draw = false;
   }
 
+  forwardSignalToTarget(senderSocket, senderId, data) {
+    const payload = { ...data, from: senderId };
+    if (typeof data.to === "string" && data.to.length > 0) {
+      const targets = this.ctx.getWebSockets(data.to);
+      for (const targetSocket of targets) {
+        if (targetSocket !== senderSocket) {
+          this.send(targetSocket, payload);
+        }
+      }
+    } else {
+      this.broadcast(payload, senderSocket);
+    }
+  }
+
   async webSocketMessage(socket, message) {
     await this.ready;
     let data;
-
     try {
       data = JSON.parse(message);
     } catch {
@@ -340,7 +357,6 @@ export class GameRoom extends DurableObject {
     }
 
     if (!data || typeof data.type !== "string") return;
-
     const attachment = socket.deserializeAttachment();
     const playerId = attachment?.playerId;
     if (!playerId) return;
@@ -356,30 +372,28 @@ export class GameRoom extends DurableObject {
       state.micActive = active;
       this.playerStates.set(playerId, state);
       socket.serializeAttachment({ playerId, state });
-
       this.broadcast({ type: "micState", from: playerId, id: playerId, active }, socket);
       return;
     }
 
-    if (data.type === "rtc-offer" || data.type === "rtc-answer" || data.type === "rtc-ice") {
-      const payload = { ...data, from: playerId };
-      if (typeof data.to === "string" && data.to.length > 0) {
-        for (const targetSocket of this.ctx.getWebSockets(data.to)) {
-          if (targetSocket !== socket) this.send(targetSocket, payload);
-        }
-      } else {
-        this.broadcast(payload, socket);
-      }
+    if (
+      data.type === "webrtcSignal" ||
+      data.type === "rtc-offer" ||
+      data.type === "rtc-answer" ||
+      data.type === "rtc-ice"
+    ) {
+      this.forwardSignalToTarget(socket, playerId, data);
       return;
     }
 
     if (data.type === "quickMessage") {
       const rawText = typeof data.message === "string"
         ? data.message
-        : typeof data.text === "string" ? data.text : "";
+        : typeof data.text === "string"
+          ? data.text
+          : "";
       const cleanMessage = rawText.trim().slice(0, 120);
       if (!cleanMessage) return;
-
       this.broadcast({
         type: "quickMessage",
         id: playerId,
@@ -395,9 +409,8 @@ export class GameRoom extends DurableObject {
       const y = Number(data.y);
       const z = Number(data.z);
       const rotation = Number(data.rotation);
-
       if (![x, y, z, rotation].every(Number.isFinite)) return;
-      if ([x, y, z, rotation].some(value => Math.abs(value) > 100000)) return;
+      if ([x, y, z, rotation].some((value) => Math.abs(value) > 1e5)) return;
 
       const previous = this.playerStates.get(playerId) || this.defaultPlayerState();
       const state = { x, y, z, rotation, micActive: previous.micActive };
@@ -405,14 +418,18 @@ export class GameRoom extends DurableObject {
       socket.serializeAttachment({ playerId, state });
 
       const clientTime = Number(data.t);
-      const timestamp = Number.isFinite(clientTime) && Math.abs(Date.now() - clientTime) < 60000
-        ? clientTime : Date.now();
-
+      const timestamp = Number.isFinite(clientTime) && Math.abs(Date.now() - clientTime) < 6e4
+        ? clientTime
+        : Date.now();
       const sequence = ++this.moveSequence;
+
       this.broadcast({
         type: "playerMove",
         id: playerId,
-        x, y, z, rotation,
+        x,
+        y,
+        z,
+        rotation,
         t: timestamp,
         seq: sequence,
         serverTime: Date.now()
@@ -426,19 +443,16 @@ export class GameRoom extends DurableObject {
         this.send(socket, { type: "join-error", error: "Nome inválido." });
         return;
       }
-
       if (this.tttPlayers.size >= 2 && !this.tttPlayers.has(playerId)) {
         this.send(socket, { type: "join-error", error: "A sala já está cheia." });
         return;
       }
-
-      const usedMarks = new Set(Array.from(this.tttPlayers.values()).map(player => player.mark));
+      const usedMarks = new Set(Array.from(this.tttPlayers.values()).map((player) => player.mark));
       const mark = usedMarks.has("X") ? "O" : "X";
-      const existingPlayerIds = Array.from(this.tttPlayers.keys()).filter(id => id !== playerId);
-
+      const existingPlayerIds = Array.from(this.tttPlayers.keys()).filter((id) => id !== playerId);
       this.tttPlayers.set(playerId, { id: playerId, name: cleanName, mark });
-      await this.persistGameState();
 
+      await this.persistGameState();
       this.send(socket, { type: "joined-room", id: playerId, mark, existingPlayerIds });
       this.broadcast({ type: "room-state", state: await this.getRoomSnapshot() });
       return;
@@ -453,7 +467,9 @@ export class GameRoom extends DurableObject {
 
       this.board[index] = player.mark;
       this.evaluateBoard();
-      if (!this.winner && !this.draw) this.turn = this.turn === "X" ? "O" : "X";
+      if (!this.winner && !this.draw) {
+        this.turn = this.turn === "X" ? "O" : "X";
+      }
 
       await this.persistGameState();
       this.broadcast({ type: "room-state", state: await this.getRoomSnapshot() });
@@ -508,17 +524,15 @@ export class GameRoom extends DurableObject {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ code: this.ctx.id.name, players })
       });
-    } catch {
-      // O jogo continua mesmo se a atualização da lista de salas falhar.
-    }
+    } catch {}
   }
 
   send(socket, data) {
     try {
-      if (socket.readyState === 1) socket.send(JSON.stringify(data));
-    } catch {
-      // Conexão indisponível.
-    }
+      if (socket.readyState === 1) {
+        socket.send(JSON.stringify(data));
+      }
+    } catch {}
   }
 
   broadcast(data, exceptSocket = null) {
@@ -526,10 +540,10 @@ export class GameRoom extends DurableObject {
     for (const socket of this.ctx.getWebSockets()) {
       if (socket === exceptSocket) continue;
       try {
-        if (socket.readyState === 1) socket.send(message);
-      } catch {
-        // Ignora conexões indisponíveis.
-      }
+        if (socket.readyState === 1) {
+          socket.send(message);
+        }
+      } catch {}
     }
   }
 }
@@ -547,33 +561,63 @@ export default {
     const lobby = env.LOBBY_MANAGER.get(lobbyId);
 
     if (url.pathname === "/ice-config") {
+      const turnUser = env.TURN_USERNAME ? String(env.TURN_USERNAME) : DEFAULT_METERED_USERNAME;
+      const turnPass = env.TURN_CREDENTIAL ? String(env.TURN_CREDENTIAL) : DEFAULT_METERED_CREDENTIAL;
+
       const iceServers = [
+        { urls: "stun:stun.relay.metered.ca:80" },
         { urls: "stun:stun.cloudflare.com:3478" },
-        { urls: "stun:stun.l.google.com:19302" },
-        { urls: "stun:stun1.l.google.com:19302" },
-        { urls: "stun:stun2.l.google.com:19302" }
+        {
+          urls: "turn:global.relay.metered.ca:80",
+          username: turnUser,
+          credential: turnPass
+        },
+        {
+          urls: "turn:global.relay.metered.ca:80?transport=tcp",
+          username: turnUser,
+          credential: turnPass
+        },
+        {
+          urls: "turn:global.relay.metered.ca:443",
+          username: turnUser,
+          credential: turnPass
+        },
+        {
+          urls: "turns:global.relay.metered.ca:443?transport=tcp",
+          username: turnUser,
+          credential: turnPass
+        }
       ];
 
       if (env.TURN_URLS) {
-        const urls = String(env.TURN_URLS).split(",").map(value => value.trim()).filter(Boolean);
+        const urls = String(env.TURN_URLS)
+          .split(",")
+          .map((value) => value.trim())
+          .filter(Boolean);
         if (urls.length) {
-          const turn = { urls };
-          if (env.TURN_USERNAME) turn.username = String(env.TURN_USERNAME);
-          if (env.TURN_CREDENTIAL) turn.credential = String(env.TURN_CREDENTIAL);
-          iceServers.push(turn);
+          const customTurn = { urls };
+          if (env.TURN_USERNAME) customTurn.username = String(env.TURN_USERNAME);
+          if (env.TURN_CREDENTIAL) customTurn.credential = String(env.TURN_CREDENTIAL);
+          iceServers.push(customTurn);
         }
       }
 
       return json({ iceServers }, 200, cors);
     }
 
-    if (url.pathname === "/rooms/create" ||
-        url.pathname === "/rooms/list" ||
-        url.pathname === "/rooms/join" ||
-        url.pathname === "/matchmaking/find") {
-      const response = await lobby.fetch(new Request(`https://lobby.internal${url.pathname}${url.search}`, request));
+    if (
+      url.pathname === "/rooms/create" ||
+      url.pathname === "/rooms/list" ||
+      url.pathname === "/rooms/join" ||
+      url.pathname === "/matchmaking/find"
+    ) {
+      const response = await lobby.fetch(
+        new Request(`https://lobby.internal${url.pathname}${url.search}`, request)
+      );
       const headers = new Headers(response.headers);
-      for (const [key, value] of Object.entries(cors)) headers.set(key, value);
+      for (const [key, value] of Object.entries(cors)) {
+        headers.set(key, value);
+      }
       return new Response(response.body, { status: response.status, headers });
     }
 
@@ -583,12 +627,16 @@ export default {
       }
 
       const code = safeRoomName(url.searchParams.get("room")).toUpperCase();
-      if (!code) return new Response("Código da sala obrigatório.", { status: 400 });
+      if (!code) {
+        return new Response("Código da sala obrigatório.", { status: 400 });
+      }
 
       const roomResponse = await lobby.fetch(
         `https://lobby.internal/internal/room?code=${encodeURIComponent(code)}`
       );
-      if (!roomResponse.ok) return new Response("Sala não encontrada.", { status: 404 });
+      if (!roomResponse.ok) {
+        return new Response("Sala não encontrada.", { status: 404 });
+      }
 
       const { room } = await roomResponse.json();
       const requestedRegion = url.searchParams.get("region");
@@ -597,14 +645,18 @@ export default {
       }
 
       const id = env.GAME_ROOM.idFromName(code);
-      // Location Hint é uma preferência de posicionamento, não garantia de região física.
       const locationHint = room.region === "EU" ? "weur" : "sam";
       const gameRoom = env.GAME_ROOM.get(id, { locationHint });
       return gameRoom.fetch(request);
     }
 
     if (url.pathname === "/health") {
-      return json({ ok: true, service: "ONY Multiplayer", regions: ["BR", "EU"], maxPlayers: MAX_PLAYERS }, 200, cors);
+      return json({
+        ok: true,
+        service: "ONY Multiplayer",
+        regions: ["BR", "EU"],
+        maxPlayers: MAX_PLAYERS
+      }, 200, cors);
     }
 
     return json({
