@@ -1,7 +1,3 @@
-var __defProp = Object.defineProperty;
-var __name = (target, value) => __defProp(target, "name", { value, configurable: true });
-
-// worker.js
 import { DurableObject } from "cloudflare:workers";
 
 const MAX_PLAYERS = 5;
@@ -20,6 +16,7 @@ const WIN_LINES = [
 const DEFAULT_PASTEFY_ACCOUNTS_URL = "https://pastefy.app/fKPMN7uS/raw";
 const DEFAULT_METERED_USERNAME = "1176eedd6d74aa647f55129f";
 const DEFAULT_METERED_CREDENTIAL = "ui23lTtzXzs+S9Iq";
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 let memoryAccountsCache = {
   items: null,
@@ -193,12 +190,232 @@ export class LobbyManager extends DurableObject {
     this.ready = ctx.blockConcurrencyWhile(async () => {
       const rooms = await ctx.storage.get("rooms");
       this.rooms = rooms && typeof rooms === "object" ? rooms : {};
+      const quotaState = await ctx.storage.get("turnQuotaState");
+      this.turnQuotaState = quotaState && typeof quotaState === "object" ? quotaState : {};
     });
+  }
+
+  getQuotaLimitBytes() {
+    const mb = Math.max(50, Number(this.env.TURN_QUOTA_MB || 480) || 480);
+    return mb * 1024 * 1024;
+  }
+
+  getResetPeriodMs() {
+    const days = Math.max(1, Number(this.env.TURN_RESET_DAYS || 30) || 30);
+    return days * DAY_MS;
+  }
+
+  ensureAccountQuotaRecord(username, now) {
+    const resetMs = this.getResetPeriodMs();
+    let rec = this.turnQuotaState[username];
+
+    if (!rec || typeof rec !== "object") {
+      rec = {
+        usedBytes: 0,
+        cycleStartedAt: now,
+        exhaustedUntil: 0,
+        failures: 0
+      };
+      this.turnQuotaState[username] = rec;
+      return { rec, changed: true };
+    }
+
+    let changed = false;
+
+    if (rec.exhaustedUntil > 0 && now >= rec.exhaustedUntil) {
+      rec.usedBytes = 0;
+      rec.cycleStartedAt = now;
+      rec.exhaustedUntil = 0;
+      rec.failures = 0;
+      changed = true;
+    } else if (rec.cycleStartedAt > 0 && now - rec.cycleStartedAt >= resetMs) {
+      rec.usedBytes = 0;
+      rec.cycleStartedAt = now;
+      rec.exhaustedUntil = 0;
+      rec.failures = 0;
+      changed = true;
+    }
+
+    return { rec, changed };
+  }
+
+  selectAvailableAccount(accounts, preferredIndex = 0) {
+    const now = Date.now();
+    const limitBytes = this.getQuotaLimitBytes();
+    const resetMs = this.getResetPeriodMs();
+    let dirty = false;
+
+    const total = accounts.length;
+    const startIdx = ((Math.max(0, Number(preferredIndex) || 0)) % total + total) % total;
+
+    for (let offset = 0; offset < total; offset++) {
+      const idx = (startIdx + offset) % total;
+      const acc = accounts[idx];
+      const { rec, changed } = this.ensureAccountQuotaRecord(acc.username, now);
+      if (changed) dirty = true;
+
+      if (rec.usedBytes >= limitBytes && rec.exhaustedUntil === 0) {
+        rec.exhaustedUntil = (rec.cycleStartedAt || now) + resetMs;
+        dirty = true;
+      }
+
+      if (rec.exhaustedUntil === 0 || now >= rec.exhaustedUntil) {
+        return { index: idx, account: acc, record: rec, allExhausted: false, dirty };
+      }
+    }
+
+    let earliestIdx = 0;
+    let earliestReset = Infinity;
+    for (let i = 0; i < total; i++) {
+      const rec = this.turnQuotaState[accounts[i].username];
+      const resetAt = rec?.exhaustedUntil || 0;
+      if (resetAt < earliestReset) {
+        earliestReset = resetAt;
+        earliestIdx = i;
+      }
+    }
+
+    return {
+      index: earliestIdx,
+      account: accounts[earliestIdx],
+      record: this.turnQuotaState[accounts[earliestIdx].username],
+      allExhausted: true,
+      dirty
+    };
   }
 
   async fetch(request) {
     await this.ready;
     const url = new URL(request.url);
+
+    if (url.pathname === "/internal/ice-config" && request.method === "GET") {
+      const accounts = await getMeteredAccounts(this.env);
+      const preferredIdx = Math.max(0, Number(this.env.ACTIVE_TURN_INDEX || 0) || 0);
+      const picked = this.selectAvailableAccount(accounts, preferredIdx);
+
+      if (picked.dirty) {
+        await this.ctx.storage.put("turnQuotaState", this.turnQuotaState);
+      }
+
+      const limitBytes = this.getQuotaLimitBytes();
+      const usedMb = Number(((picked.record?.usedBytes || 0) / (1024 * 1024)).toFixed(2));
+      const limitMb = Math.round(limitBytes / (1024 * 1024));
+
+      return json({
+        accountIndex: picked.index,
+        totalAccounts: accounts.length,
+        accountLabel: picked.account.label || `Conta_${picked.index + 1}`,
+        username: picked.account.username,
+        usedMb,
+        limitMb,
+        allExhausted: picked.allExhausted,
+        nextResetAt: picked.record?.exhaustedUntil || ((picked.record?.cycleStartedAt || Date.now()) + this.getResetPeriodMs()),
+        iceServers: buildIceServersForAccount(picked.account)
+      });
+    }
+
+    if (url.pathname === "/internal/ice-usage" && request.method === "POST") {
+      const body = await readJson(request);
+      const username = String(body?.username || "").trim();
+      const deltaBytes = Math.max(0, Number(body?.bytes || 0) || 0);
+      if (!username || deltaBytes <= 0) {
+        return json({ ok: false, error: "Dados de consumo inválidos." }, 400);
+      }
+
+      const now = Date.now();
+      const limitBytes = this.getQuotaLimitBytes();
+      const resetMs = this.getResetPeriodMs();
+      const { rec } = this.ensureAccountQuotaRecord(username, now);
+
+      rec.usedBytes += deltaBytes;
+      if (rec.usedBytes >= limitBytes && rec.exhaustedUntil === 0) {
+        rec.exhaustedUntil = (rec.cycleStartedAt || now) + resetMs;
+      }
+
+      await this.ctx.storage.put("turnQuotaState", this.turnQuotaState);
+      return json({
+        ok: true,
+        username,
+        usedMb: Number((rec.usedBytes / (1024 * 1024)).toFixed(2)),
+        exhausted: rec.exhaustedUntil > now,
+        exhaustedUntil: rec.exhaustedUntil
+      });
+    }
+
+    if (url.pathname === "/internal/ice-exhaust" && request.method === "POST") {
+      const body = await readJson(request);
+      const username = String(body?.username || "").trim();
+      const force = Boolean(body?.force);
+      if (!username) {
+        return json({ ok: false, error: "Username obrigatório." }, 400);
+      }
+
+      const now = Date.now();
+      const limitBytes = this.getQuotaLimitBytes();
+      const resetMs = this.getResetPeriodMs();
+      const { rec } = this.ensureAccountQuotaRecord(username, now);
+
+      rec.failures = (rec.failures || 0) + 1;
+
+      if (force || rec.failures >= 3) {
+        rec.usedBytes = Math.max(rec.usedBytes, limitBytes);
+        rec.exhaustedUntil = (rec.cycleStartedAt || now) + resetMs;
+      }
+
+      await this.ctx.storage.put("turnQuotaState", this.turnQuotaState);
+
+      const accounts = await getMeteredAccounts(this.env);
+      const preferredIdx = Math.max(0, Number(this.env.ACTIVE_TURN_INDEX || 0) || 0);
+      const nextPicked = this.selectAvailableAccount(accounts, preferredIdx);
+
+      return json({
+        ok: true,
+        markedExhausted: rec.exhaustedUntil > now,
+        exhaustedUntil: rec.exhaustedUntil,
+        nextAccountIndex: nextPicked.index,
+        nextAccountLabel: nextPicked.account.label,
+        nextUsername: nextPicked.account.username,
+        iceServers: buildIceServersForAccount(nextPicked.account)
+      });
+    }
+
+    if (url.pathname === "/internal/ice-status" && request.method === "GET") {
+      const accounts = await getMeteredAccounts(this.env);
+      const now = Date.now();
+      const limitBytes = this.getQuotaLimitBytes();
+      const resetMs = this.getResetPeriodMs();
+      let dirty = false;
+
+      const summary = accounts.map((acc, index) => {
+        const { rec, changed } = this.ensureAccountQuotaRecord(acc.username, now);
+        if (changed) dirty = true;
+        const exhausted = rec.exhaustedUntil > now;
+        const resetTarget = exhausted ? rec.exhaustedUntil : ((rec.cycleStartedAt || now) + resetMs);
+        const daysRemaining = exhausted ? Math.max(1, Math.ceil((resetTarget - now) / DAY_MS)) : 0;
+
+        return {
+          index,
+          label: acc.label,
+          username: acc.username,
+          usedMb: Number((rec.usedBytes / (1024 * 1024)).toFixed(2)),
+          limitMb: Math.round(limitBytes / (1024 * 1024)),
+          exhausted,
+          daysRemaining,
+          resetAt: exhausted ? new Date(rec.exhaustedUntil).toISOString() : null
+        };
+      });
+
+      if (dirty) {
+        await this.ctx.storage.put("turnQuotaState", this.turnQuotaState);
+      }
+
+      return json({
+        ok: true,
+        totalAccounts: accounts.length,
+        availableAccounts: summary.filter((s) => !s.exhausted).length,
+        accounts: summary
+      });
+    }
 
     if (url.pathname === "/internal/room" && request.method === "GET") {
       const code = safeRoomName(url.searchParams.get("code")).toUpperCase();
@@ -678,6 +895,17 @@ export class GameRoom extends DurableObject {
   }
 }
 
+async function forwardToLobbyWithCors(lobby, internalPath, request, cors) {
+  const response = await lobby.fetch(
+    new Request(`https://lobby.internal${internalPath}`, request)
+  );
+  const headers = new Headers(response.headers);
+  for (const [key, value] of Object.entries(cors)) {
+    headers.set(key, value);
+  }
+  return new Response(response.body, { status: response.status, headers });
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -690,20 +918,20 @@ export default {
     const lobbyId = env.LOBBY_MANAGER.idFromName("global-lobby");
     const lobby = env.LOBBY_MANAGER.get(lobbyId);
 
-    if (url.pathname === "/ice-config") {
-      const accounts = await getMeteredAccounts(env);
-      const rawIdx = url.searchParams.get("account");
-      const defaultIdx = Math.max(0, Number(env.ACTIVE_TURN_INDEX || 0) || 0);
-      const parsedIdx = rawIdx !== null ? Math.max(0, Number(rawIdx) || 0) : defaultIdx;
-      const safeIndex = parsedIdx % accounts.length;
-      const selected = accounts[safeIndex];
+    if (url.pathname === "/ice-config" && request.method === "GET") {
+      return forwardToLobbyWithCors(lobby, `/internal/ice-config${url.search}`, request, cors);
+    }
 
-      return json({
-        accountIndex: safeIndex,
-        totalAccounts: accounts.length,
-        accountLabel: selected.label || `Conta_${safeIndex + 1}`,
-        iceServers: buildIceServersForAccount(selected)
-      }, 200, cors);
+    if (url.pathname === "/ice-config/usage" && request.method === "POST") {
+      return forwardToLobbyWithCors(lobby, "/internal/ice-usage", request, cors);
+    }
+
+    if (url.pathname === "/ice-config/report-failure" && request.method === "POST") {
+      return forwardToLobbyWithCors(lobby, "/internal/ice-exhaust", request, cors);
+    }
+
+    if (url.pathname === "/ice-config/status" && request.method === "GET") {
+      return forwardToLobbyWithCors(lobby, "/internal/ice-status", request, cors);
     }
 
     if (
@@ -712,14 +940,7 @@ export default {
       url.pathname === "/rooms/join" ||
       url.pathname === "/matchmaking/find"
     ) {
-      const response = await lobby.fetch(
-        new Request(`https://lobby.internal${url.pathname}${url.search}`, request)
-      );
-      const headers = new Headers(response.headers);
-      for (const [key, value] of Object.entries(cors)) {
-        headers.set(key, value);
-      }
-      return new Response(response.body, { status: response.status, headers });
+      return forwardToLobbyWithCors(lobby, `${url.pathname}${url.search}`, request, cors);
     }
 
     if (url.pathname === "/game") {
@@ -770,6 +991,9 @@ export default {
         "POST /matchmaking/find",
         "GET /game?room=CODIGO",
         "GET /ice-config",
+        "POST /ice-config/usage",
+        "POST /ice-config/report-failure",
+        "GET /ice-config/status",
         "GET /health"
       ]
     }, 200, cors);
