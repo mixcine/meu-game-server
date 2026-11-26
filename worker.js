@@ -18,6 +18,11 @@ const DEFAULT_METERED_CREDENTIAL = "ui23lTtzXzs+S9Iq";
 const DEFAULT_TURN_LIMIT_MB = 480;
 const BYTES_PER_MB = 1024 * 1024;
 
+const DEFAULT_PASTEFY_API_KEY =
+  "cGtzAjhCUnFoVVaC33USW3AkgrrP2ODpXT44eiopqVwDNMAfgvxzF7qQgtsb";
+const DEFAULT_PASTEFY_PASTE_ID = "fKPMN7uS";
+const DEFAULT_PASTEFY_PART_NAME = "matered-credenciais";
+
 let memoryAccountsCache = {
   items: null,
   expiresAt: 0
@@ -194,6 +199,84 @@ function getCycleKeyAndDaysRemaining(nowMs = Date.now()) {
   return { cycleKey, daysRemaining };
 }
 
+async function fetchRealMeteredUsage(env) {
+  const appName = String(env.METERED_APP_NAME || "onybye").trim();
+  const secretKey = String(env.METERED_SECRET_KEY || "").trim();
+
+  if (!secretKey) return null;
+
+  try {
+    const resp = await fetch(
+      `https://${encodeURIComponent(appName)}.metered.live/api/v1/turn/current_usage?secretKey=${encodeURIComponent(secretKey)}`,
+      { cf: { cacheTtl: 60, cacheEverything: true } }
+    );
+
+    if (!resp.ok) return null;
+
+    const data = await resp.json();
+    const limitMb = Math.round((Number(data.quotaInGB) || 0.5) * 1000);
+    const usedMb = Number(((Number(data.usageInGB) || 0) * 1000).toFixed(2));
+    const remainingMb = Math.max(0, Number((limitMb - usedMb).toFixed(2)));
+
+    return {
+      usedMb,
+      remainingMb,
+      limitMb,
+      exhausted: remainingMb <= 5
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function syncQuotaToPastefy(env, snapshot) {
+  const apiKey = String(env.PASTEFY_API_KEY || DEFAULT_PASTEFY_API_KEY).trim();
+  const pasteId = String(env.PASTEFY_PASTE_ID || DEFAULT_PASTEFY_PASTE_ID).trim();
+  const partName = String(env.PASTEFY_PART_NAME || DEFAULT_PASTEFY_PART_NAME).trim();
+
+  if (!apiKey || !pasteId) return;
+
+  const usedMb = Number(snapshot?.usedMb ?? 0);
+  const limitMb = Number(snapshot?.limitMb ?? DEFAULT_TURN_LIMIT_MB);
+  const remainingMb = Number(
+    snapshot?.remainingMb ?? Math.max(0, Number((limitMb - usedMb).toFixed(2)))
+  );
+
+  const payload = {
+    updatedAt: new Date().toISOString(),
+    source: snapshot?.source || "ice-config",
+    accountLabel: snapshot?.accountLabel || "Conta_1",
+    username: snapshot?.username || "",
+    usedMb,
+    remainingMb,
+    limitMb,
+    daysRemaining: Number(snapshot?.daysRemaining ?? 0),
+    exhausted: Boolean(snapshot?.exhausted)
+  };
+
+  const formatted = JSON.stringify(payload, null, 2);
+
+  try {
+    await fetch(`https://pastefy.app/api/v2/paste/${encodeURIComponent(pasteId)}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        title: "ONY Metered TURN Quota",
+        content: formatted,
+        parts: [
+          {
+            name: partName,
+            content: formatted
+          }
+        ]
+      })
+    });
+  } catch (_) {}
+}
+
 export class LobbyManager extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
@@ -274,6 +357,7 @@ export class LobbyManager extends DurableObject {
       const selected = accounts[chosenIdx];
       const rec = this.turnQuota.accounts[selected.username] || { bytesUsed: 0, exhausted: false };
       const usedMb = Number(((rec.bytesUsed || 0) / BYTES_PER_MB).toFixed(2));
+      const remainingMb = Math.max(0, Number((limitMb - usedMb).toFixed(2)));
 
       return json({
         ok: true,
@@ -282,6 +366,7 @@ export class LobbyManager extends DurableObject {
         accountLabel: selected.label || `Conta_${chosenIdx + 1}`,
         username: selected.username,
         usedMb,
+        remainingMb,
         limitMb,
         daysRemaining,
         exhausted: Boolean(rec.exhausted),
@@ -345,6 +430,7 @@ export class LobbyManager extends DurableObject {
       const nextAcc = accounts[nextIdx];
       const nextRec = this.turnQuota.accounts[nextAcc.username] || { bytesUsed: 0, exhausted: false };
       const usedMb = Number(((nextRec.bytesUsed || 0) / BYTES_PER_MB).toFixed(2));
+      const remainingMb = Math.max(0, Number((limitMb - usedMb).toFixed(2)));
 
       return json({
         ok: true,
@@ -355,8 +441,10 @@ export class LobbyManager extends DurableObject {
         nextAccountLabel: nextAcc.label || `Conta_${nextIdx + 1}`,
         accountLabel: nextAcc.label || `Conta_${nextIdx + 1}`,
         usedMb,
+        remainingMb,
         limitMb,
         daysRemaining,
+        exhausted: Boolean(nextRec.exhausted),
         iceServers: buildIceServersForAccount(nextAcc)
       });
     }
@@ -396,11 +484,13 @@ export class LobbyManager extends DurableObject {
       await this.ctx.storage.put("turnQuota", this.turnQuota);
 
       const usedMb = Number((rec.bytesUsed / BYTES_PER_MB).toFixed(2));
+      const remainingMb = Math.max(0, Number((limitMb - usedMb).toFixed(2)));
       return json({
         ok: true,
         username: targetAcc.username,
         accountLabel: rec.label,
         usedMb,
+        remainingMb,
         limitMb,
         daysRemaining,
         exhausted: Boolean(rec.exhausted)
@@ -886,7 +976,7 @@ export class GameRoom extends DurableObject {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const cors = corsHeaders();
 
@@ -906,14 +996,39 @@ export default {
         query.set("force", url.searchParams.get("force"));
       }
       const qs = query.toString();
-      const response = await lobby.fetch(
-        `https://lobby.internal/internal/ice-config${qs ? `?${qs}` : ""}`
-      );
+
+      const [response, realUsage] = await Promise.all([
+        lobby.fetch(`https://lobby.internal/internal/ice-config${qs ? `?${qs}` : ""}`),
+        fetchRealMeteredUsage(env)
+      ]);
+
+      const rawBody = await response.text();
+      let finalBody = rawBody;
+
+      if (response.ok) {
+        try {
+          const parsed = JSON.parse(rawBody);
+          if (realUsage) {
+            parsed.usedMb = realUsage.usedMb;
+            parsed.remainingMb = realUsage.remainingMb;
+            parsed.limitMb = realUsage.limitMb;
+            parsed.exhausted = realUsage.exhausted;
+          }
+          finalBody = JSON.stringify(parsed);
+          ctx.waitUntil(
+            syncQuotaToPastefy(env, {
+              ...parsed,
+              source: realUsage ? "ice-config-real" : "ice-config"
+            })
+          );
+        } catch (_) {}
+      }
+
       const headers = new Headers(response.headers);
       for (const [key, value] of Object.entries(cors)) {
         headers.set(key, value);
       }
-      return new Response(response.body, { status: response.status, headers });
+      return new Response(finalBody, { status: response.status, headers });
     }
 
     if (url.pathname === "/ice-config/report-failure" && request.method === "POST") {
@@ -924,11 +1039,18 @@ export default {
           body: request.body
         })
       );
+      const rawBody = await response.text();
+      if (response.ok) {
+        try {
+          const parsed = JSON.parse(rawBody);
+          ctx.waitUntil(syncQuotaToPastefy(env, { ...parsed, source: "report-failure" }));
+        } catch (_) {}
+      }
       const headers = new Headers(response.headers);
       for (const [key, value] of Object.entries(cors)) {
         headers.set(key, value);
       }
-      return new Response(response.body, { status: response.status, headers });
+      return new Response(rawBody, { status: response.status, headers });
     }
 
     if (url.pathname === "/ice-config/usage" && request.method === "POST") {
@@ -939,11 +1061,18 @@ export default {
           body: request.body
         })
       );
+      const rawBody = await response.text();
+      if (response.ok) {
+        try {
+          const parsed = JSON.parse(rawBody);
+          ctx.waitUntil(syncQuotaToPastefy(env, { ...parsed, source: "usage" }));
+        } catch (_) {}
+      }
       const headers = new Headers(response.headers);
       for (const [key, value] of Object.entries(cors)) {
         headers.set(key, value);
       }
-      return new Response(response.body, { status: response.status, headers });
+      return new Response(rawBody, { status: response.status, headers });
     }
 
     if (
